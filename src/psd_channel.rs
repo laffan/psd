@@ -197,7 +197,7 @@ pub trait IntoRgba {
 }
 
 /// Rle decompress a channel
-fn rle_decompress(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn rle_decompress(bytes: &[u8]) -> Vec<u8> {
     let mut cursor = PsdCursor::new(&bytes[..]);
 
     let mut decompressed = vec![];
@@ -375,6 +375,8 @@ mod tests {
                 ChannelBytes::RleCompressed(vec![0, 0, 0]),
             )]),
             layer_properties,
+            layer_mask: None,
+            vector_mask: None,
         };
 
         let mut rgba = vec![0; (layer.width() * layer.height() * 4) as usize];
