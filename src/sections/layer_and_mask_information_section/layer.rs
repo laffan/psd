@@ -8,6 +8,8 @@ use crate::psd_channel::PsdChannelCompression;
 use crate::psd_channel::PsdChannelError;
 use crate::psd_channel::PsdChannelKind;
 use crate::sections::image_data_section::ChannelBytes;
+use crate::sections::layer_and_mask_information_section::layer_mask::LayerMask;
+use crate::sections::layer_and_mask_information_section::vector_mask::VectorMask;
 
 /// Information about a layer in a PSD file.
 ///
@@ -138,6 +140,10 @@ pub struct PsdGroup {
     pub(crate) contained_layers: Range<usize>,
     /// Common layer properties
     pub(crate) layer_properties: LayerProperties,
+    /// Layer mask metadata (bbox, flags)
+    pub(crate) layer_mask: Option<LayerMask>,
+    /// Vector mask data (Bezier paths)
+    pub(crate) vector_mask: Option<VectorMask>,
 }
 
 impl PsdGroup {
@@ -158,7 +164,24 @@ impl PsdGroup {
             id,
             contained_layers,
             layer_properties,
+            layer_mask: layer_record.layer_mask.clone(),
+            vector_mask: layer_record.vector_mask.clone(),
         }
+    }
+
+    /// Returns the vector mask for this group, if one exists.
+    pub fn vector_mask(&self) -> Option<&VectorMask> {
+        self.vector_mask.as_ref()
+    }
+
+    /// Returns true if this group has a vector mask.
+    pub fn has_vector_mask(&self) -> bool {
+        self.vector_mask.is_some()
+    }
+
+    /// Returns the layer mask metadata (bounding box, flags) if one exists.
+    pub fn mask(&self) -> Option<&LayerMask> {
+        self.layer_mask.as_ref()
     }
 
     /// A unique identifier for the layer within the PSD file
@@ -191,6 +214,10 @@ pub struct PsdLayer {
     pub(crate) channels: LayerChannels,
     /// Common layer properties
     pub(crate) layer_properties: LayerProperties,
+    /// Layer mask metadata (bbox, flags)
+    pub(crate) layer_mask: Option<LayerMask>,
+    /// Vector mask data (Bezier paths)
+    pub(crate) vector_mask: Option<VectorMask>,
 }
 
 /// An error when working with a PsdLayer
@@ -227,6 +254,8 @@ impl PsdLayer {
                 group_id,
             ),
             channels,
+            layer_mask: layer_record.layer_mask.clone(),
+            vector_mask: layer_record.vector_mask.clone(),
         }
     }
 
@@ -249,6 +278,45 @@ impl PsdLayer {
     /// vec![R, G, B, A, R, G, B, A, ...]
     pub fn rgba(&self) -> Vec<u8> {
         self.generate_rgba()
+    }
+
+    /// Returns the vector mask for this layer, if one exists.
+    ///
+    /// Vector masks contain Bezier path data with coordinates normalized to 0.0–1.0.
+    /// Multiply by the document width/height to get pixel coordinates.
+    pub fn vector_mask(&self) -> Option<&VectorMask> {
+        self.vector_mask.as_ref()
+    }
+
+    /// Returns true if this layer has a vector mask.
+    pub fn has_vector_mask(&self) -> bool {
+        self.vector_mask.is_some()
+    }
+
+    /// Returns the layer mask metadata (bounding box, flags) if one exists.
+    pub fn mask(&self) -> Option<&LayerMask> {
+        self.layer_mask.as_ref()
+    }
+
+    /// Returns the mask pixel data as grayscale bytes (one byte per pixel).
+    ///
+    /// The dimensions of the returned data are `mask.width() * mask.height()`.
+    /// Returns `None` if no mask is present or no mask channel data is available.
+    pub fn mask_pixels(&self) -> Option<Vec<u8>> {
+        self.layer_mask.as_ref()?;
+
+        // Try UserSuppliedLayerMask (-2) first, then RealUserSuppliedLayerMask (-3)
+        let channel_bytes = self
+            .channels
+            .get(&PsdChannelKind::UserSuppliedLayerMask)
+            .or_else(|| self.channels.get(&PsdChannelKind::RealUserSuppliedLayerMask))?;
+
+        Some(match channel_bytes {
+            ChannelBytes::RawData(data) => data.clone(),
+            ChannelBytes::RleCompressed(data) => {
+                crate::psd_channel::rle_decompress(data)
+            }
+        })
     }
 
     // Get one of the PsdLayerChannels of this PsdLayer
@@ -394,6 +462,10 @@ pub struct LayerRecord {
     pub(super) blend_mode: BlendMode,
     /// Group divider tag
     pub(super) divider_type: Option<GroupDivider>,
+    /// Layer mask metadata (bbox, flags)
+    pub(super) layer_mask: Option<LayerMask>,
+    /// Vector mask data (Bezier paths)
+    pub(super) vector_mask: Option<VectorMask>,
 }
 
 impl LayerRecord {

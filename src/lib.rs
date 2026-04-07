@@ -27,6 +27,10 @@ use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
 pub use crate::sections::layer_and_mask_information_section::layer::PsdGroup;
 pub use crate::sections::layer_and_mask_information_section::layer::PsdLayer;
+pub use crate::sections::layer_and_mask_information_section::layer_mask::LayerMask;
+pub use crate::sections::layer_and_mask_information_section::vector_mask::{
+    BezierKnot, PathPoint, Subpath, VectorMask,
+};
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
 

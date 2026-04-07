@@ -8,7 +8,11 @@ use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, GroupDivider, LayerChannels, LayerRecord, PsdGroup, PsdLayer, PsdLayerError,
 };
+use crate::sections::layer_and_mask_information_section::layer_mask::parse_layer_mask;
 use crate::sections::layer_and_mask_information_section::layers::Layers;
+use crate::sections::layer_and_mask_information_section::vector_mask::{
+    parse_vector_mask, VectorMask,
+};
 use crate::sections::PsdCursor;
 
 /// One of the possible additional layer block signatures
@@ -21,10 +25,16 @@ const SIGNATURE_EIGHT_B64: [u8; 4] = [56, 66, 54, 52];
 const KEY_UNICODE_LAYER_NAME: &[u8; 4] = b"luni";
 /// Key of `Section divider setting (Photoshop 6.0)`, "lsct"
 const KEY_SECTION_DIVIDER_SETTING: &[u8; 4] = b"lsct";
+/// Key of `Vector mask setting 1`, "vmsk"
+const KEY_VECTOR_MASK_SETTING_1: &[u8; 4] = b"vmsk";
+/// Key of `Vector mask setting 2`, "vsms"
+const KEY_VECTOR_MASK_SETTING_2: &[u8; 4] = b"vsms";
 
 pub mod groups;
 pub mod layer;
+pub mod layer_mask;
 pub mod layers;
+pub mod vector_mask;
 
 /// The LayerAndMaskInformationSection comes from the bytes in the fourth section of the PSD.
 ///
@@ -224,10 +234,17 @@ impl LayerAndMaskInformationSection {
 
         let mut result = vec![];
         for layer_record in layer_records {
+            let mask_scanlines = layer_record
+                .layer_mask
+                .as_ref()
+                .map(|m| m.height() as usize)
+                .unwrap_or(0);
+
             let channels = read_layer_channels(
                 cursor,
                 &layer_record.channel_data_lengths,
                 layer_record.height() as usize,
+                mask_scanlines,
             )?;
 
             result.push((layer_record, channels));
@@ -258,7 +275,8 @@ impl LayerAndMaskInformationSection {
 fn read_layer_channels(
     cursor: &mut PsdCursor,
     channel_data_lengths: &Vec<(PsdChannelKind, u32)>,
-    scanlines: usize,
+    layer_scanlines: usize,
+    mask_scanlines: usize,
 ) -> Result<LayerChannels, PsdLayerError> {
     let capacity = channel_data_lengths.len();
     let mut channels = HashMap::with_capacity(capacity);
@@ -272,6 +290,14 @@ fn read_layer_channels(
             compression
         } else {
             PsdChannelCompression::RawData
+        };
+
+        // Mask channels (-2, -3) use mask dimensions, not layer dimensions
+        let scanlines = match channel_kind {
+            PsdChannelKind::UserSuppliedLayerMask | PsdChannelKind::RealUserSuppliedLayerMask => {
+                mask_scanlines
+            }
+            _ => layer_scanlines,
         };
 
         let channel_data = cursor.read(*channel_length);
@@ -394,9 +420,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     // We do not currently use the length of the extra data field, skip it
     cursor.read_4();
 
-    // We do not currently use the layer mask data, skip it
-    let layer_mask_data_len = cursor.read_u32();
-    cursor.read(layer_mask_data_len);
+    // Parse layer mask data (bbox, flags) instead of skipping it
+    let layer_mask = parse_layer_mask(cursor);
 
     // We do not currently use the layer blending range, skip it
     let layer_blending_range_data_len = cursor.read_u32();
@@ -418,6 +443,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     cursor.read(padding as u32);
 
     let mut divider_type = None;
+    let mut vector_mask: Option<VectorMask> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -446,6 +472,10 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                     cursor.read_4();
                 }
             }
+            KEY_VECTOR_MASK_SETTING_1 | KEY_VECTOR_MASK_SETTING_2 => {
+                let vmsk_data = cursor.read(additional_layer_info_len);
+                vector_mask = parse_vector_mask(vmsk_data);
+            }
 
             // TODO: Skipping other keys until we implement parsing for them
             _ => {
@@ -466,5 +496,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         clipping_base,
         blend_mode,
         divider_type,
+        layer_mask,
+        vector_mask,
     })
 }
