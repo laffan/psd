@@ -57,7 +57,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use psd::{PsdGroup, PsdLayer};
+use psd::{BlendMode, PsdGroup, PsdLayer};
 use serde_json::{json, Value};
 
 /// A single fixture to exercise, with a few quick assertions about the file.
@@ -215,6 +215,74 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
             fixture.name,
             layer_name
         );
+    }
+
+    // Exercise the BlendMode re-export at the crate root — if this stops
+    // compiling the re-export in lib.rs has regressed. Every layer in every
+    // fixture in this test happens to use the default Normal blend mode, but
+    // we match exhaustively so any variant would still type-check.
+    for layer in psd.layers() {
+        match layer.blend_mode() {
+            BlendMode::PassThrough
+            | BlendMode::Normal
+            | BlendMode::Dissolve
+            | BlendMode::Darken
+            | BlendMode::Multiply
+            | BlendMode::ColorBurn
+            | BlendMode::LinearBurn
+            | BlendMode::DarkerColor
+            | BlendMode::Lighten
+            | BlendMode::Screen
+            | BlendMode::ColorDodge
+            | BlendMode::LinearDodge
+            | BlendMode::LighterColor
+            | BlendMode::Overlay
+            | BlendMode::SoftLight
+            | BlendMode::HardLight
+            | BlendMode::VividLight
+            | BlendMode::LinearLight
+            | BlendMode::PinLight
+            | BlendMode::HardMix
+            | BlendMode::Difference
+            | BlendMode::Exclusion
+            | BlendMode::Subtract
+            | BlendMode::Divide
+            | BlendMode::Hue
+            | BlendMode::Saturation
+            | BlendMode::Color
+            | BlendMode::Luminosity => {}
+        }
+    }
+
+    // Exercise PsdGroup::contained_layers(). The range covers every layer
+    // nested under the group at any depth (not just direct children), so a
+    // group's layer-index span must contain every flat-index whose ancestor
+    // chain passes through that group.
+    for (&gid, group) in psd.groups() {
+        let span = group.contained_layers();
+        for (idx, layer) in psd.layers().iter().enumerate() {
+            let mut is_descendant = false;
+            let mut cur = layer.parent_id();
+            while let Some(p) = cur {
+                if p == gid {
+                    is_descendant = true;
+                    break;
+                }
+                cur = psd.groups().get(&p).and_then(|g| g.parent_id());
+            }
+            if is_descendant {
+                assert!(
+                    span.contains(&idx),
+                    "{}: layer '{}' (idx {}) is a descendant of group '{}' but \
+                     not in its contained_layers range {:?}",
+                    fixture.name,
+                    layer.name(),
+                    idx,
+                    group.name(),
+                    span
+                );
+            }
+        }
     }
 
     // --- 1. Full-canvas composite (equivalent to psd.composite() in psd-tools) ---

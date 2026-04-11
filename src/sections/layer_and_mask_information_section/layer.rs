@@ -188,6 +188,20 @@ impl PsdGroup {
     pub fn id(&self) -> u32 {
         self.id
     }
+
+    /// The range of indices into [`Psd::layers()`] for the layers that are
+    /// directly contained in this group.
+    ///
+    /// This mirrors the flat layer index space, so a caller can iterate the
+    /// group's children with `for idx in group.contained_layers() { psd.layer_by_idx(idx) }`.
+    /// Note that the range may include layers nested in subgroups of this
+    /// group — filter by [`PsdLayer::parent_id`] if you only want *direct*
+    /// children.
+    ///
+    /// [`Psd::layers()`]: crate::Psd::layers
+    pub fn contained_layers(&self) -> Range<usize> {
+        self.contained_layers.clone()
+    }
 }
 
 impl Deref for PsdGroup {
