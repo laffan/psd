@@ -474,34 +474,90 @@ fn process_psd(name: &str, psd: &psd::Psd, out_dir: &Path) -> Result<String> {
     let canvas_bytes = fs::metadata(out_dir.join("canvas.png"))?.len();
     assert!(canvas_bytes > 0, "{}: canvas.png is empty", name);
 
-    // --- 2. Per-layer composites (equivalent to layer.composite().save()) ---
+    // --- 2. Per-layer composites ---
+    // Write both `layers/NN_Name.png` (raw rgba) and
+    // `layers/NN_Name_composite.png` (composite_rgba with opacity + mask).
+    // A Rust port of psd-to-json should use composite_rgba() for sprites.
     let mut layer_png_count = 0usize;
     let mut mask_png_count = 0usize;
     for (idx, layer) in psd.layers().iter().enumerate() {
         // Skip layers that have no pixel data (pure group markers can have
-        // zero-sized bounds). The rgba() call on these would still yield an
-        // all-transparent buffer, but there's no point writing a blank PNG.
+        // zero-sized bounds).
         if layer.width() == 0 || layer.height() == 0 {
             continue;
         }
-        let rgba = layer.rgba();
-        // PsdLayer::rgba() produces a *full-canvas-sized* RGBA buffer with
-        // the layer positioned at its offset. That matches what psd-to-json
-        // gets back from `layer.composite()` (PIL with offset applied), so we
-        // can write it directly.
+
+        let raw_rgba = layer.rgba();
+        let comp_rgba = layer.composite_rgba();
+
+        // Both must be full-canvas-sized.
+        let expected_len = (width * height * 4) as usize;
         assert_eq!(
-            rgba.len(),
-            (width * height * 4) as usize,
-            "{}: layer '{}' rgba unexpected size",
-            name,
-            layer.name()
+            raw_rgba.len(), expected_len,
+            "{}: layer '{}' raw rgba unexpected size", name, layer.name()
         );
+        assert_eq!(
+            comp_rgba.len(), expected_len,
+            "{}: layer '{}' composite rgba unexpected size", name, layer.name()
+        );
+
+        // When the layer has full opacity (255) and no mask, raw and
+        // composite must be identical.
+        if layer.opacity() == 255 && layer.mask().is_none() {
+            assert_eq!(
+                raw_rgba, comp_rgba,
+                "{}: layer '{}' has opacity 255 + no mask, but composite differs from raw",
+                name, layer.name()
+            );
+        }
+
+        // When the layer has reduced opacity, the composited alpha must be
+        // <= the raw alpha for every pixel (opacity only attenuates).
+        if layer.opacity() < 255 {
+            for i in 0..(width * height) as usize {
+                assert!(
+                    comp_rgba[i * 4 + 3] <= raw_rgba[i * 4 + 3],
+                    "{}: layer '{}' pixel {} composite alpha ({}) > raw alpha ({})",
+                    name, layer.name(), i,
+                    comp_rgba[i * 4 + 3], raw_rgba[i * 4 + 3]
+                );
+            }
+        }
+
+        // When the layer has a non-disabled mask with default_color == 0,
+        // pixels outside the mask bbox should be fully transparent in the
+        // composite even if they have content in the raw.
+        if let Some(mask_meta) = layer.mask() {
+            if !mask_meta.disabled && mask_meta.default_color == 0 {
+                let ml = mask_meta.left;
+                let mt = mask_meta.top;
+                let mr = mask_meta.left + mask_meta.width() as i32;
+                let mb = mask_meta.top + mask_meta.height() as i32;
+
+                for y in 0..height as i32 {
+                    for x in 0..width as i32 {
+                        let outside_mask = x < ml || x >= mr || y < mt || y >= mb;
+                        if outside_mask {
+                            let idx = (y * width as i32 + x) as usize;
+                            assert_eq!(
+                                comp_rgba[idx * 4 + 3], 0,
+                                "{}: layer '{}' pixel ({},{}) outside mask bbox \
+                                 should have alpha 0 in composite, got {}",
+                                name, layer.name(), x, y, comp_rgba[idx * 4 + 3]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write the composited PNG (this is the one a psd-to-json port uses).
         let filename = format!("{:02}_{}.png", idx, sanitize(layer.name()));
-        write_rgba_png(&out_dir.join("layers").join(&filename), width, height, &rgba)
+        write_rgba_png(&out_dir.join("layers").join(&filename), width, height, &comp_rgba)
             .with_context(|| format!("writing layer PNG {filename}"))?;
         layer_png_count += 1;
 
-        // --- 3. Raster mask (equivalent to layer.mask.topil().save()) ---
+        // --- 3. Raster mask as standalone grayscale PNG ---
         if let Some(mask_meta) = layer.mask() {
             if let Some(mask_pixels) = layer.mask_pixels() {
                 let mw = mask_meta.width();
@@ -512,6 +568,33 @@ fn process_psd(name: &str, psd: &psd::Psd, out_dir: &Path) -> Result<String> {
                         .with_context(|| format!("writing mask PNG {mask_name}"))?;
                     mask_png_count += 1;
                 }
+            }
+        }
+    }
+
+    // --- 2b. Psd::group_bounds() ---
+    // For every group that has at least one non-empty layer, verify that
+    // group_bounds() returns Some and that the bbox fully encloses every
+    // descendant layer.
+    for (&gid, _group) in psd.groups() {
+        if let Some((g_top, g_left, g_bottom, g_right)) = psd.group_bounds(gid) {
+            for idx in psd.groups()[&gid].contained_layers() {
+                let l = psd.layer_by_idx(idx);
+                if l.width() == 0 || l.height() == 0 {
+                    continue;
+                }
+                assert!(
+                    l.layer_top() >= g_top
+                        && l.layer_left() >= g_left
+                        && l.layer_bottom() <= g_bottom
+                        && l.layer_right() <= g_right,
+                    "{}: group '{}' bounds ({},{},{},{}) don't enclose layer '{}' ({},{},{},{})",
+                    name,
+                    psd.groups()[&gid].name(),
+                    g_top, g_left, g_bottom, g_right,
+                    l.name(),
+                    l.layer_top(), l.layer_left(), l.layer_bottom(), l.layer_right()
+                );
             }
         }
     }
@@ -633,7 +716,7 @@ fn child_to_json(
                 .into_iter()
                 .map(|c| child_to_json(psd, c, children_by_group, depth + 1))
                 .collect();
-            group_to_json(group, gid, depth, kids)
+            group_to_json(psd, group, gid, depth, kids)
         }
     }
 }
@@ -717,7 +800,7 @@ fn layer_to_json(layer: &PsdLayer, idx: usize, depth: usize) -> Value {
     Value::Object(attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
-fn group_to_json(group: &PsdGroup, gid: u32, depth: usize, children: Vec<Value>) -> Value {
+fn group_to_json(psd: &psd::Psd, group: &PsdGroup, gid: u32, depth: usize, children: Vec<Value>) -> Value {
     let mut attrs: BTreeMap<&str, Value> = BTreeMap::new();
     attrs.insert("kind", json!("group"));
     attrs.insert("id", json!(gid));
@@ -727,10 +810,26 @@ fn group_to_json(group: &PsdGroup, gid: u32, depth: usize, children: Vec<Value>)
     attrs.insert("opacity", json!(group.opacity()));
     attrs.insert("alpha", json!(group.opacity() as f64 / 255.0));
     attrs.insert("blend_mode", json!(format!("{:?}", group.blend_mode())));
-    attrs.insert("x", json!(group.layer_left()));
-    attrs.insert("y", json!(group.layer_top()));
-    attrs.insert("width", json!(group.width()));
-    attrs.insert("height", json!(group.height()));
+
+    // Use computed bounds (union of descendant layers) instead of the
+    // unreliable values from the group divider record.
+    if let Some((top, left, bottom, right)) = psd.group_bounds(gid) {
+        attrs.insert("x", json!(left));
+        attrs.insert("y", json!(top));
+        attrs.insert("width", json!((right - left) + 1));
+        attrs.insert("height", json!((bottom - top) + 1));
+        attrs.insert(
+            "computed_bounds",
+            json!({ "top": top, "left": left, "bottom": bottom, "right": right }),
+        );
+    } else {
+        // Empty group — use zeros.
+        attrs.insert("x", json!(0));
+        attrs.insert("y", json!(0));
+        attrs.insert("width", json!(0));
+        attrs.insert("height", json!(0));
+    }
+
     attrs.insert("children", Value::Array(children));
     Value::Object(attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
