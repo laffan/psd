@@ -180,6 +180,120 @@ fn psd_to_json_feature_smoke_test() -> Result<()> {
     Ok(())
 }
 
+/// Run the same processing against one or more PSD files supplied by the
+/// user at runtime via the `PSD_TO_JSON_INPUT` environment variable.
+///
+/// The variable may point to either:
+///   - a single `.psd` file, or
+///   - a directory — every `.psd` file directly inside is processed.
+///
+/// When unset, this test prints usage instructions and returns Ok (a no-op
+/// "pass") so `cargo test` stays green for people who don't have their own
+/// PSDs handy. To actually exercise your own artwork:
+///
+///     PSD_TO_JSON_INPUT=/path/to/my.psd \
+///       cargo test --test psd_to_json_integration \
+///                  psd_to_json_user_input -- --nocapture
+///
+///     PSD_TO_JSON_INPUT=/path/to/psd-dir \
+///       cargo test --test psd_to_json_integration \
+///                  psd_to_json_user_input -- --nocapture
+///
+/// Outputs land in the same directory the fixture test uses, under a
+/// `user-input/<file_stem>/` subfolder — `canvas.png`, `layers/*.png`,
+/// `masks/*.png`, and `data.json` per input file.
+#[test]
+fn psd_to_json_user_input() -> Result<()> {
+    let Some(input) = std::env::var_os("PSD_TO_JSON_INPUT") else {
+        eprintln!(
+            "\n[psd_to_json_integration] PSD_TO_JSON_INPUT not set — skipping.\n\
+             To process your own PSDs:\n\
+             \n    \
+             PSD_TO_JSON_INPUT=/path/to/file.psd \\\n    \
+             \x20\x20cargo test --test psd_to_json_integration \\\n    \
+             \x20\x20            psd_to_json_user_input -- --nocapture\n\
+             \n\
+             PSD_TO_JSON_INPUT may also be a directory of .psd files.\n"
+        );
+        return Ok(());
+    };
+
+    let input_path = PathBuf::from(input);
+    if !input_path.exists() {
+        anyhow::bail!("PSD_TO_JSON_INPUT path does not exist: {}", input_path.display());
+    }
+
+    // Collect the list of PSD files to process.
+    let files: Vec<PathBuf> = if input_path.is_dir() {
+        let mut v: Vec<PathBuf> = fs::read_dir(&input_path)
+            .with_context(|| format!("reading dir {}", input_path.display()))?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("psd"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![input_path.clone()]
+    };
+
+    if files.is_empty() {
+        eprintln!(
+            "[psd_to_json_integration] no .psd files found at {}",
+            input_path.display()
+        );
+        return Ok(());
+    }
+
+    let output_root = output_root()?.join("user-input");
+    fs::create_dir_all(&output_root)?;
+
+    eprintln!(
+        "\n[psd_to_json_integration] processing {} user PSD file(s)",
+        files.len()
+    );
+    eprintln!("[psd_to_json_integration] writing outputs to: {}\n", output_root.display());
+
+    let mut summary: Vec<String> = Vec::new();
+
+    for psd_path in files {
+        let name = psd_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(sanitize)
+            .unwrap_or_else(|| "user_input".to_string());
+
+        let out_dir = output_root.join(&name);
+        if out_dir.exists() {
+            fs::remove_dir_all(&out_dir)?;
+        }
+        fs::create_dir_all(out_dir.join("layers"))?;
+        fs::create_dir_all(out_dir.join("masks"))?;
+
+        let bytes = fs::read(&psd_path)
+            .with_context(|| format!("reading {}", psd_path.display()))?;
+        let psd = psd::Psd::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e:?}", psd_path.display()))?;
+
+        let report = process_psd(&name, &psd, &out_dir)
+            .with_context(|| format!("processing {}", psd_path.display()))?;
+        summary.push(report);
+    }
+
+    eprintln!("[psd_to_json_integration] user-input summary:");
+    for line in &summary {
+        eprintln!("  {line}");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
 /// Parse a single fixture PSD, write outputs to `out_dir`, and run the
 /// fixture's assertions. Returns a one-line summary.
 fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
@@ -217,10 +331,76 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
         );
     }
 
+    // Core output writing + generic assertions (applied to every PSD).
+    let summary = process_psd(fixture.name, &psd, out_dir)?;
+
+    // Fixture-specific JSON assertions (re-read the file written above).
+    let reparsed: Value =
+        serde_json::from_slice(&fs::read(out_dir.join("data.json"))?)?;
+
+    if fixture.name == "one-group-with-two-subgroups" {
+        // Top-level children must appear in Photoshop order:
+        //   outside group, Firth Layer, outside group 2
+        let tops = reparsed["layers"].as_array().expect("layers array");
+        let names: Vec<&str> = tops
+            .iter()
+            .map(|n| n["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["outside group", "Firth Layer", "outside group 2"],
+            "top-level order"
+        );
+        // "outside group" must contain, in order: first group inside,
+        // second group inside, Fourth Layer, third group inside.
+        let outside = &tops[0];
+        let kids = outside["children"].as_array().expect("children");
+        let kid_names: Vec<&str> = kids
+            .iter()
+            .map(|n| n["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kid_names,
+            vec![
+                "first group inside",
+                "second group inside",
+                "Fourth Layer",
+                "third group inside"
+            ],
+            "outside-group children order"
+        );
+    }
+    if fixture.name == "vector-mask-and-layer-mask" {
+        // At least one layer in this fixture has a vector_mask with >= 1 path.
+        let tops = reparsed["layers"].as_array().unwrap();
+        let has_vm = tops.iter().any(|n| {
+            n.get("vector_mask")
+                .and_then(|vm| vm["paths"].as_array())
+                .map(|p| !p.is_empty())
+                .unwrap_or(false)
+        });
+        assert!(has_vm, "expected at least one vector_mask path in JSON");
+        // And at least one layer should carry a raster mask bbox.
+        let has_mask = tops.iter().any(|n| n.get("mask").is_some());
+        assert!(has_mask, "expected at least one raster mask in JSON");
+    }
+
+    Ok(summary)
+}
+
+/// Write the full set of psd-to-json-style outputs for a parsed PSD and run
+/// the feature-coverage assertions that apply to *every* PSD (not just the
+/// bundled fixtures). Returns a one-line summary string.
+///
+/// Shared by the fixture test and the user-input test so both paths exercise
+/// the same write-out + assert logic.
+fn process_psd(name: &str, psd: &psd::Psd, out_dir: &Path) -> Result<String> {
+    let width = psd.width();
+    let height = psd.height();
+
     // Exercise the BlendMode re-export at the crate root — if this stops
-    // compiling the re-export in lib.rs has regressed. Every layer in every
-    // fixture in this test happens to use the default Normal blend mode, but
-    // we match exhaustively so any variant would still type-check.
+    // compiling the re-export in lib.rs has regressed. The exhaustive arm
+    // also guards against new variants being added without the test knowing.
     for layer in psd.layers() {
         match layer.blend_mode() {
             BlendMode::PassThrough
@@ -275,7 +455,7 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
                     span.contains(&idx),
                     "{}: layer '{}' (idx {}) is a descendant of group '{}' but \
                      not in its contained_layers range {:?}",
-                    fixture.name,
+                    name,
                     layer.name(),
                     idx,
                     group.name(),
@@ -292,7 +472,7 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
     write_rgba_png(&out_dir.join("canvas.png"), width, height, &canvas_rgba)
         .context("writing canvas.png")?;
     let canvas_bytes = fs::metadata(out_dir.join("canvas.png"))?.len();
-    assert!(canvas_bytes > 0, "{}: canvas.png is empty", fixture.name);
+    assert!(canvas_bytes > 0, "{}: canvas.png is empty", name);
 
     // --- 2. Per-layer composites (equivalent to layer.composite().save()) ---
     let mut layer_png_count = 0usize;
@@ -313,7 +493,7 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
             rgba.len(),
             (width * height * 4) as usize,
             "{}: layer '{}' rgba unexpected size",
-            fixture.name,
+            name,
             layer.name()
         );
         let filename = format!("{:02}_{}.png", idx, sanitize(layer.name()));
@@ -337,66 +517,18 @@ fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
     }
 
     // --- 4. JSON document ---
-    let data_json = build_json(&psd);
+    let data_json = build_json(psd);
     let json_path = out_dir.join("data.json");
     fs::write(&json_path, serde_json::to_vec_pretty(&data_json)?)?;
     // Round-trip the JSON to make sure we produced something well-formed.
     let reparsed: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
     assert_eq!(reparsed["width"], json!(width));
     assert_eq!(reparsed["height"], json!(height));
-    assert!(reparsed["layers"].is_array(), "{}: layers is not array", fixture.name);
-
-    // Fixture-specific JSON assertions.
-    if fixture.name == "one-group-with-two-subgroups" {
-        // Top-level children must appear in Photoshop order:
-        //   outside group, Firth Layer, outside group 2
-        let tops = reparsed["layers"].as_array().expect("layers array");
-        let names: Vec<&str> = tops
-            .iter()
-            .map(|n| n["name"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["outside group", "Firth Layer", "outside group 2"],
-            "top-level order"
-        );
-        // "outside group" must contain, in order: first group inside,
-        // second group inside, Fourth Layer, third group inside.
-        let outside = &tops[0];
-        let kids = outside["children"].as_array().expect("children");
-        let kid_names: Vec<&str> = kids
-            .iter()
-            .map(|n| n["name"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(
-            kid_names,
-            vec![
-                "first group inside",
-                "second group inside",
-                "Fourth Layer",
-                "third group inside"
-            ],
-            "outside-group children order"
-        );
-    }
-    if fixture.name == "vector-mask-and-layer-mask" {
-        // At least one layer in this fixture has a vector_mask with >= 1 path.
-        let tops = reparsed["layers"].as_array().unwrap();
-        let has_vm = tops.iter().any(|n| {
-            n.get("vector_mask")
-                .and_then(|vm| vm["paths"].as_array())
-                .map(|p| !p.is_empty())
-                .unwrap_or(false)
-        });
-        assert!(has_vm, "expected at least one vector_mask path in JSON");
-        // And at least one layer should carry a raster mask bbox.
-        let has_mask = tops.iter().any(|n| n.get("mask").is_some());
-        assert!(has_mask, "expected at least one raster mask in JSON");
-    }
+    assert!(reparsed["layers"].is_array(), "{}: layers is not array", name);
 
     Ok(format!(
         "{name}: {w}x{h}, {layers} layers ({layer_pngs} PNGs, {masks} masks), {groups} groups -> {dir}",
-        name = fixture.name,
+        name = name,
         w = width,
         h = height,
         layers = psd.layers().len(),
