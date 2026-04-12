@@ -188,6 +188,20 @@ impl PsdGroup {
     pub fn id(&self) -> u32 {
         self.id
     }
+
+    /// The range of indices into [`Psd::layers()`] for the layers that are
+    /// directly contained in this group.
+    ///
+    /// This mirrors the flat layer index space, so a caller can iterate the
+    /// group's children with `for idx in group.contained_layers() { psd.layer_by_idx(idx) }`.
+    /// Note that the range may include layers nested in subgroups of this
+    /// group — filter by [`PsdLayer::parent_id`] if you only want *direct*
+    /// children.
+    ///
+    /// [`Psd::layers()`]: crate::Psd::layers
+    pub fn contained_layers(&self) -> Range<usize> {
+        self.contained_layers.clone()
+    }
 }
 
 impl Deref for PsdGroup {
@@ -278,6 +292,77 @@ impl PsdLayer {
     /// vec![R, G, B, A, R, G, B, A, ...]
     pub fn rgba(&self) -> Vec<u8> {
         self.generate_rgba()
+    }
+
+    /// Create a composited RGBA image for this layer.
+    ///
+    /// Unlike [`rgba()`](PsdLayer::rgba), which returns the raw decoded channel
+    /// data, this method produces pixels closer to what Photoshop displays:
+    ///
+    /// 1. Starts with the raw RGBA channel data (full canvas size).
+    /// 2. Multiplies the alpha channel by the layer's **opacity** (0–255).
+    /// 3. Applies the **raster mask**, if present and not disabled — pixels
+    ///    inside the mask bbox are attenuated by the mask value; pixels outside
+    ///    use the mask's `default_color`.
+    ///
+    /// Vector mask clipping is **not** currently applied — shape layers with
+    /// vector-only masks will still show the full bounding-box pixel content.
+    ///
+    /// The returned buffer is `psd_width * psd_height * 4` bytes (same as
+    /// `rgba()`).
+    pub fn composite_rgba(&self) -> Vec<u8> {
+        let mut rgba = self.rgba();
+        let psd_w = self.layer_properties.psd_width;
+        let psd_h = self.layer_properties.psd_height;
+        let opacity = self.layer_properties.opacity;
+        let pixel_count = (psd_w * psd_h) as usize;
+
+        // Step 1: Apply layer opacity to the alpha channel.
+        if opacity < 255 {
+            for i in 0..pixel_count {
+                let a = rgba[i * 4 + 3] as u16;
+                rgba[i * 4 + 3] = ((a * opacity as u16 + 127) / 255) as u8;
+            }
+        }
+
+        // Step 2: Apply raster mask (if present and enabled).
+        if let Some(mask_meta) = self.mask() {
+            if !mask_meta.disabled {
+                let mask_data = self.mask_pixels();
+                let mask_left = mask_meta.left;
+                let mask_top = mask_meta.top;
+                let mask_w = mask_meta.width() as i32;
+                let mask_h = mask_meta.height() as i32;
+                let default = mask_meta.default_color;
+                let invert = mask_meta.invert;
+
+                for y in 0..psd_h as i32 {
+                    for x in 0..psd_w as i32 {
+                        let mx = x - mask_left;
+                        let my = y - mask_top;
+
+                        let raw = if mx >= 0 && mx < mask_w && my >= 0 && my < mask_h {
+                            match &mask_data {
+                                Some(data) => data[(my * mask_w + mx) as usize],
+                                None => default,
+                            }
+                        } else {
+                            default
+                        };
+
+                        let mask_value = if invert { 255 - raw } else { raw };
+
+                        if mask_value < 255 {
+                            let idx = (y * psd_w as i32 + x) as usize * 4 + 3;
+                            let a = rgba[idx] as u16;
+                            rgba[idx] = ((a * mask_value as u16 + 127) / 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        rgba
     }
 
     /// Returns the vector mask for this layer, if one exists.

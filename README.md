@@ -46,7 +46,7 @@ That said, if there's anything missing that you need [please feel very free to o
 ## Usage
 
 ```rust
-use psd::{ColorMode, Psd, PsdChannelCompression};
+use psd::{BlendMode, ColorMode, Psd, PsdChannelCompression, PsdChannelKind};
 
 fn main () {
     // .. Get a byte slice of PSD file data somehow ..
@@ -68,21 +68,35 @@ fn main () {
     for layer in psd.layers().iter() {
         let name = layer.name();
 
-        let pixels: Vec<u8> = layer.rgba().unwrap();
+        // Raw decoded channels (no opacity or mask applied).
+        let raw_pixels: Vec<u8> = layer.rgba();
+
+        // Composited pixels with opacity and raster mask baked in —
+        // closer to what Photoshop displays.
+        let sprite_pixels: Vec<u8> = layer.composite_rgba();
     }
 
     let green_layer = psd.layer_by_name("Green Layer").unwrap();
 
     // In this layer the red channel is uncompressed
-    assert_eq!(green_layer.compression(&PsdChannelKind::Red).unwrap(), PsdChannelCompression::RawData);
+    assert_eq!(green_layer.compression(PsdChannelKind::Red).unwrap(), PsdChannelCompression::RawData);
 
     // In this layer the green channel is RLE compressed
-    assert_eq!(green_layer.compression(&PsdChannelKind::Green).unwrap(), PsdChannelCompression::RleCompressed);
+    assert_eq!(green_layer.compression(PsdChannelKind::Green).unwrap(), PsdChannelCompression::RleCompressed);
 
     // Combine the PSD layers top to bottom, ignoring any layers that begin with an `_`
     let pixels: Vec<u8> = psd.flatten_layers_rgba(&|(_idx, layer)| {
         !layer.name().starts_with("_")
     }).unwrap();
+
+    // Get computed bounds for a group (union of descendant layers).
+    for (&id, group) in psd.groups() {
+        if let Some((top, left, bottom, right)) = psd.group_bounds(id) {
+            let w = (right - left) + 1;
+            let h = (bottom - top) + 1;
+            println!("group '{}' covers {}x{} at ({}, {})", group.name(), w, h, left, top);
+        }
+    }
 }
 ```
 

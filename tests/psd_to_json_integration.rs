@@ -1,0 +1,899 @@
+//! End-to-end integration test that exercises every PSD feature the Python
+//! project `psd-to-json` (https://github.com/laffan/psd-to-json) uses from
+//! `psd-tools`, implemented against the Rust `psd` crate.
+//!
+//! The goal is to give a concrete, runnable smoke test that proves this fork
+//! of `psd` can serve as the backbone for a Rust port of `psd-to-json`.
+//!
+//! For each fixture PSD this test:
+//!
+//!   1. Parses the PSD with `psd::Psd::from_bytes`
+//!   2. Walks the layer tree (respecting groups/nesting) and builds a JSON
+//!      document similar in shape to what `psd-to-json` emits
+//!   3. Writes a per-PSD output directory containing:
+//!        - `canvas.png`        full flattened document
+//!        - `layers/<n>_<name>.png`   per-layer RGBA composites
+//!        - `masks/<n>_<name>_mask.png`  per-layer raster masks (when present)
+//!        - `data.json`         the JSON structure for that PSD
+//!   4. Asserts a handful of known-good values so regressions are caught
+//!
+//! The outputs land in `$CARGO_TARGET_TMPDIR/<psd_name>/`. Cargo sets that
+//! variable for integration tests; on a fresh checkout it resolves to
+//! `target/tmp/psd_to_json_integration/<psd_name>/`.
+//!
+//! Run with:
+//!
+//!     cargo test --test psd_to_json_integration -- --nocapture
+//!
+//! The `--nocapture` flag lets the test print the absolute output path so you
+//! can open the generated PNGs and JSON in a viewer.
+//!
+//! ## What psd-to-json uses from psd-tools (and the Rust equivalents)
+//!
+//! | psd-tools (Python)                    | Rust `psd` crate                    |
+//! |---------------------------------------|-------------------------------------|
+//! | `PSDImage.open(path)`                 | `Psd::from_bytes(&bytes)`           |
+//! | `psd.width`, `psd.height`             | `Psd::width()`, `Psd::height()`     |
+//! | iterate nested `.layers`              | `Psd::groups()` + layer `parent_id` |
+//! | `layer.name`                          | `PsdLayer::name()`                  |
+//! | `layer.left/top/right/bottom`         | `PsdLayer::layer_{left,top,...}()`  |
+//! | `layer.width`, `layer.height`         | `PsdLayer::width()`, `height()`     |
+//! | `layer.is_visible()`, `.visible`      | `PsdLayer::visible()`               |
+//! | `layer.opacity` (0..255)              | `PsdLayer::opacity()`               |
+//! | `layer.blend_mode`                    | `PsdLayer::blend_mode()`            |
+//! | `layer.is_group()` / `isinstance`     | enumerate `Psd::groups()`           |
+//! | `layer.composite()` -> PIL image      | `PsdLayer::rgba()`                  |
+//! | `psd.composite()` / final render      | `Psd::flatten_layers_rgba()`        |
+//! | `layer.mask.bbox`                     | `PsdLayer::mask()` -> `LayerMask`   |
+//! | `layer.mask.topil()`                  | `PsdLayer::mask_pixels()`           |
+//! | `layer.has_vector_mask()`             | `PsdLayer::has_vector_mask()`       |
+//! | `layer.vector_mask.paths[...].knots`  | `PsdLayer::vector_mask()`           |
+//!
+//! psd-to-json never touches smart objects, text layers, layer effects or
+//! styles, clip layers, or adjustment layers — so this test doesn't either.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use psd::{BlendMode, PsdGroup, PsdLayer};
+use serde_json::{json, Value};
+
+/// A single fixture to exercise, with a few quick assertions about the file.
+struct Fixture {
+    /// Short name used for the output directory.
+    name: &'static str,
+    /// PSD bytes (embedded via `include_bytes!`).
+    bytes: &'static [u8],
+    /// Optional expectations. `None` means "don't assert this value".
+    expected_width: Option<u32>,
+    expected_height: Option<u32>,
+    expected_layer_count: Option<usize>,
+    expected_group_count: Option<usize>,
+    /// Layer-name -> expected parent group name (or `None` = top-level).
+    expected_layer_parents: &'static [(&'static str, Option<&'static str>)],
+}
+
+/// The fixtures we exercise. These cover every PSD feature psd-to-json needs.
+fn fixtures() -> Vec<Fixture> {
+    vec![
+        // Two layers, no groups — basic per-layer composite + bounds smoke test.
+        Fixture {
+            name: "two-layers-red-green-1x1",
+            bytes: include_bytes!("fixtures/two-layers-red-green-1x1.psd"),
+            expected_width: Some(1),
+            expected_height: Some(1),
+            expected_layer_count: Some(2),
+            expected_group_count: Some(0),
+            expected_layer_parents: &[],
+        },
+        // 3 layers at non-trivial size with RLE compression — checks that
+        // decoded RGBA round-trips through PNG encoding.
+        Fixture {
+            name: "rle-3-layer-8x8",
+            bytes: include_bytes!("fixtures/rle-3-layer-8x8.psd"),
+            expected_width: Some(8),
+            expected_height: Some(8),
+            expected_layer_count: Some(3),
+            expected_group_count: Some(0),
+            expected_layer_parents: &[],
+        },
+        // Deeply nested groups — stress test of the group tree walker.
+        Fixture {
+            name: "one-group-with-two-subgroups",
+            bytes: include_bytes!("fixtures/groups/green-1x1-one-group-with-two-subgroups.psd"),
+            expected_width: Some(1),
+            expected_height: Some(1),
+            expected_layer_count: Some(6),
+            expected_group_count: Some(6),
+            expected_layer_parents: &[
+                ("First Layer", Some("first group inside")),
+                ("Second Layer", Some("sub sub group")),
+                ("Third Layer", Some("second group inside")),
+                ("Fourth Layer", Some("outside group")),
+                ("Firth Layer", None),
+                ("Sixth Layer", Some("outside group 2")),
+            ],
+        },
+        // Visibility flags — psd-to-json reads `.visible` on every layer.
+        Fixture {
+            name: "visibility",
+            bytes: include_bytes!("fixtures/visibility.psd"),
+            expected_width: None,
+            expected_height: None,
+            expected_layer_count: None,
+            expected_group_count: None,
+            expected_layer_parents: &[],
+        },
+        // Partial transparency — opacity & alpha-aware per-layer rasterization.
+        Fixture {
+            name: "16x16-rle-partially-opaque",
+            bytes: include_bytes!("fixtures/16x16-rle-partially-opaque.psd"),
+            expected_width: Some(16),
+            expected_height: Some(16),
+            expected_layer_count: None,
+            expected_group_count: None,
+            expected_layer_parents: &[],
+        },
+        // Exercises both raster and vector mask parsing / export.
+        Fixture {
+            name: "vector-mask-and-layer-mask",
+            bytes: include_bytes!("fixtures/vector-mask-and-layer-mask.psd"),
+            expected_width: None,
+            expected_height: None,
+            expected_layer_count: None,
+            expected_group_count: None,
+            expected_layer_parents: &[],
+        },
+    ]
+}
+
+#[test]
+fn psd_to_json_feature_smoke_test() -> Result<()> {
+    let output_root = output_root()?;
+    fs::create_dir_all(&output_root)?;
+    eprintln!("\n[psd_to_json_integration] writing outputs to: {}\n", output_root.display());
+
+    let mut summary: Vec<String> = Vec::new();
+
+    for fixture in fixtures() {
+        let fixture_dir = output_root.join(fixture.name);
+        // Start from a clean slate each run so stale output can't mask a bug.
+        if fixture_dir.exists() {
+            fs::remove_dir_all(&fixture_dir)?;
+        }
+        fs::create_dir_all(fixture_dir.join("layers"))?;
+        fs::create_dir_all(fixture_dir.join("masks"))?;
+
+        let report = process_fixture(&fixture, &fixture_dir)
+            .with_context(|| format!("processing fixture '{}'", fixture.name))?;
+        summary.push(report);
+    }
+
+    eprintln!("\n[psd_to_json_integration] summary:");
+    for line in summary {
+        eprintln!("  {line}");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
+/// Run the same processing against one or more PSD files supplied by the
+/// user at runtime via the `PSD_TO_JSON_INPUT` environment variable.
+///
+/// The variable may point to either:
+///   - a single `.psd` file, or
+///   - a directory — every `.psd` file directly inside is processed.
+///
+/// When unset, this test prints usage instructions and returns Ok (a no-op
+/// "pass") so `cargo test` stays green for people who don't have their own
+/// PSDs handy. To actually exercise your own artwork:
+///
+///     PSD_TO_JSON_INPUT=/path/to/my.psd \
+///       cargo test --test psd_to_json_integration \
+///                  psd_to_json_user_input -- --nocapture
+///
+///     PSD_TO_JSON_INPUT=/path/to/psd-dir \
+///       cargo test --test psd_to_json_integration \
+///                  psd_to_json_user_input -- --nocapture
+///
+/// Outputs land in the same directory the fixture test uses, under a
+/// `user-input/<file_stem>/` subfolder — `canvas.png`, `layers/*.png`,
+/// `masks/*.png`, and `data.json` per input file.
+#[test]
+fn psd_to_json_user_input() -> Result<()> {
+    let Some(input) = std::env::var_os("PSD_TO_JSON_INPUT") else {
+        eprintln!(
+            "\n[psd_to_json_integration] PSD_TO_JSON_INPUT not set — skipping.\n\
+             To process your own PSDs:\n\
+             \n    \
+             PSD_TO_JSON_INPUT=/path/to/file.psd \\\n    \
+             \x20\x20cargo test --test psd_to_json_integration \\\n    \
+             \x20\x20            psd_to_json_user_input -- --nocapture\n\
+             \n\
+             PSD_TO_JSON_INPUT may also be a directory of .psd files.\n"
+        );
+        return Ok(());
+    };
+
+    let input_path = PathBuf::from(input);
+    if !input_path.exists() {
+        anyhow::bail!("PSD_TO_JSON_INPUT path does not exist: {}", input_path.display());
+    }
+
+    // Collect the list of PSD files to process.
+    let files: Vec<PathBuf> = if input_path.is_dir() {
+        let mut v: Vec<PathBuf> = fs::read_dir(&input_path)
+            .with_context(|| format!("reading dir {}", input_path.display()))?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("psd"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![input_path.clone()]
+    };
+
+    if files.is_empty() {
+        eprintln!(
+            "[psd_to_json_integration] no .psd files found at {}",
+            input_path.display()
+        );
+        return Ok(());
+    }
+
+    let output_root = output_root()?.join("user-input");
+    fs::create_dir_all(&output_root)?;
+
+    eprintln!(
+        "\n[psd_to_json_integration] processing {} user PSD file(s)",
+        files.len()
+    );
+    eprintln!("[psd_to_json_integration] writing outputs to: {}\n", output_root.display());
+
+    let mut summary: Vec<String> = Vec::new();
+
+    for psd_path in files {
+        let name = psd_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(sanitize)
+            .unwrap_or_else(|| "user_input".to_string());
+
+        let out_dir = output_root.join(&name);
+        if out_dir.exists() {
+            fs::remove_dir_all(&out_dir)?;
+        }
+        fs::create_dir_all(out_dir.join("layers"))?;
+        fs::create_dir_all(out_dir.join("masks"))?;
+
+        let bytes = fs::read(&psd_path)
+            .with_context(|| format!("reading {}", psd_path.display()))?;
+        let psd = psd::Psd::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e:?}", psd_path.display()))?;
+
+        let report = process_psd(&name, &psd, &out_dir)
+            .with_context(|| format!("processing {}", psd_path.display()))?;
+        summary.push(report);
+    }
+
+    eprintln!("[psd_to_json_integration] user-input summary:");
+    for line in &summary {
+        eprintln!("  {line}");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
+/// Parse a single fixture PSD, write outputs to `out_dir`, and run the
+/// fixture's assertions. Returns a one-line summary.
+fn process_fixture(fixture: &Fixture, out_dir: &Path) -> Result<String> {
+    let psd = psd::Psd::from_bytes(fixture.bytes)
+        .map_err(|e| anyhow::anyhow!("Psd::from_bytes failed: {e:?}"))?;
+
+    let width = psd.width();
+    let height = psd.height();
+
+    if let Some(exp) = fixture.expected_width {
+        assert_eq!(width, exp, "{}: width", fixture.name);
+    }
+    if let Some(exp) = fixture.expected_height {
+        assert_eq!(height, exp, "{}: height", fixture.name);
+    }
+    if let Some(exp) = fixture.expected_layer_count {
+        assert_eq!(psd.layers().len(), exp, "{}: layer count", fixture.name);
+    }
+    if let Some(exp) = fixture.expected_group_count {
+        assert_eq!(psd.groups().len(), exp, "{}: group count", fixture.name);
+    }
+    for (layer_name, expected_parent) in fixture.expected_layer_parents {
+        let layer = psd
+            .layer_by_name(layer_name)
+            .ok_or_else(|| anyhow::anyhow!("missing layer '{layer_name}'"))?;
+        let actual_parent_name = layer
+            .parent_id()
+            .and_then(|id| psd.groups().get(&id).map(|g| g.name().to_string()));
+        assert_eq!(
+            actual_parent_name.as_deref(),
+            *expected_parent,
+            "{}: parent of layer '{}'",
+            fixture.name,
+            layer_name
+        );
+    }
+
+    // Core output writing + generic assertions (applied to every PSD).
+    let summary = process_psd(fixture.name, &psd, out_dir)?;
+
+    // Fixture-specific JSON assertions (re-read the file written above).
+    let reparsed: Value =
+        serde_json::from_slice(&fs::read(out_dir.join("data.json"))?)?;
+
+    if fixture.name == "one-group-with-two-subgroups" {
+        // Top-level children must appear in Photoshop order:
+        //   outside group, Firth Layer, outside group 2
+        let tops = reparsed["layers"].as_array().expect("layers array");
+        let names: Vec<&str> = tops
+            .iter()
+            .map(|n| n["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["outside group", "Firth Layer", "outside group 2"],
+            "top-level order"
+        );
+        // "outside group" must contain, in order: first group inside,
+        // second group inside, Fourth Layer, third group inside.
+        let outside = &tops[0];
+        let kids = outside["children"].as_array().expect("children");
+        let kid_names: Vec<&str> = kids
+            .iter()
+            .map(|n| n["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kid_names,
+            vec![
+                "first group inside",
+                "second group inside",
+                "Fourth Layer",
+                "third group inside"
+            ],
+            "outside-group children order"
+        );
+    }
+    if fixture.name == "vector-mask-and-layer-mask" {
+        // At least one layer in this fixture has a vector_mask with >= 1 path.
+        let tops = reparsed["layers"].as_array().unwrap();
+        let has_vm = tops.iter().any(|n| {
+            n.get("vector_mask")
+                .and_then(|vm| vm["paths"].as_array())
+                .map(|p| !p.is_empty())
+                .unwrap_or(false)
+        });
+        assert!(has_vm, "expected at least one vector_mask path in JSON");
+        // And at least one layer should carry a raster mask bbox.
+        let has_mask = tops.iter().any(|n| n.get("mask").is_some());
+        assert!(has_mask, "expected at least one raster mask in JSON");
+    }
+
+    Ok(summary)
+}
+
+/// Write the full set of psd-to-json-style outputs for a parsed PSD and run
+/// the feature-coverage assertions that apply to *every* PSD (not just the
+/// bundled fixtures). Returns a one-line summary string.
+///
+/// Shared by the fixture test and the user-input test so both paths exercise
+/// the same write-out + assert logic.
+fn process_psd(name: &str, psd: &psd::Psd, out_dir: &Path) -> Result<String> {
+    let width = psd.width();
+    let height = psd.height();
+
+    // Exercise the BlendMode re-export at the crate root — if this stops
+    // compiling the re-export in lib.rs has regressed. The exhaustive arm
+    // also guards against new variants being added without the test knowing.
+    for layer in psd.layers() {
+        match layer.blend_mode() {
+            BlendMode::PassThrough
+            | BlendMode::Normal
+            | BlendMode::Dissolve
+            | BlendMode::Darken
+            | BlendMode::Multiply
+            | BlendMode::ColorBurn
+            | BlendMode::LinearBurn
+            | BlendMode::DarkerColor
+            | BlendMode::Lighten
+            | BlendMode::Screen
+            | BlendMode::ColorDodge
+            | BlendMode::LinearDodge
+            | BlendMode::LighterColor
+            | BlendMode::Overlay
+            | BlendMode::SoftLight
+            | BlendMode::HardLight
+            | BlendMode::VividLight
+            | BlendMode::LinearLight
+            | BlendMode::PinLight
+            | BlendMode::HardMix
+            | BlendMode::Difference
+            | BlendMode::Exclusion
+            | BlendMode::Subtract
+            | BlendMode::Divide
+            | BlendMode::Hue
+            | BlendMode::Saturation
+            | BlendMode::Color
+            | BlendMode::Luminosity => {}
+        }
+    }
+
+    // Exercise PsdGroup::contained_layers(). The range covers every layer
+    // nested under the group at any depth (not just direct children), so a
+    // group's layer-index span must contain every flat-index whose ancestor
+    // chain passes through that group.
+    for (&gid, group) in psd.groups() {
+        let span = group.contained_layers();
+        for (idx, layer) in psd.layers().iter().enumerate() {
+            let mut is_descendant = false;
+            let mut cur = layer.parent_id();
+            while let Some(p) = cur {
+                if p == gid {
+                    is_descendant = true;
+                    break;
+                }
+                cur = psd.groups().get(&p).and_then(|g| g.parent_id());
+            }
+            if is_descendant {
+                assert!(
+                    span.contains(&idx),
+                    "{}: layer '{}' (idx {}) is a descendant of group '{}' but \
+                     not in its contained_layers range {:?}",
+                    name,
+                    layer.name(),
+                    idx,
+                    group.name(),
+                    span
+                );
+            }
+        }
+    }
+
+    // --- 1. Full-canvas composite (equivalent to psd.composite() in psd-tools) ---
+    let canvas_rgba = psd
+        .flatten_layers_rgba(&|_| true)
+        .map_err(|e| anyhow::anyhow!("flatten_layers_rgba failed: {e:?}"))?;
+    write_rgba_png(&out_dir.join("canvas.png"), width, height, &canvas_rgba)
+        .context("writing canvas.png")?;
+    let canvas_bytes = fs::metadata(out_dir.join("canvas.png"))?.len();
+    assert!(canvas_bytes > 0, "{}: canvas.png is empty", name);
+
+    // --- 2. Per-layer composites ---
+    // Write both `layers/NN_Name.png` (raw rgba) and
+    // `layers/NN_Name_composite.png` (composite_rgba with opacity + mask).
+    // A Rust port of psd-to-json should use composite_rgba() for sprites.
+    let mut layer_png_count = 0usize;
+    let mut mask_png_count = 0usize;
+    for (idx, layer) in psd.layers().iter().enumerate() {
+        // Skip layers that have no pixel data (pure group markers can have
+        // zero-sized bounds).
+        if layer.width() == 0 || layer.height() == 0 {
+            continue;
+        }
+
+        let raw_rgba = layer.rgba();
+        let comp_rgba = layer.composite_rgba();
+
+        // Both must be full-canvas-sized.
+        let expected_len = (width * height * 4) as usize;
+        assert_eq!(
+            raw_rgba.len(), expected_len,
+            "{}: layer '{}' raw rgba unexpected size", name, layer.name()
+        );
+        assert_eq!(
+            comp_rgba.len(), expected_len,
+            "{}: layer '{}' composite rgba unexpected size", name, layer.name()
+        );
+
+        // When the layer has full opacity (255) and no mask, raw and
+        // composite must be identical.
+        if layer.opacity() == 255 && layer.mask().is_none() {
+            assert_eq!(
+                raw_rgba, comp_rgba,
+                "{}: layer '{}' has opacity 255 + no mask, but composite differs from raw",
+                name, layer.name()
+            );
+        }
+
+        // When the layer has reduced opacity, the composited alpha must be
+        // <= the raw alpha for every pixel (opacity only attenuates).
+        if layer.opacity() < 255 {
+            for i in 0..(width * height) as usize {
+                assert!(
+                    comp_rgba[i * 4 + 3] <= raw_rgba[i * 4 + 3],
+                    "{}: layer '{}' pixel {} composite alpha ({}) > raw alpha ({})",
+                    name, layer.name(), i,
+                    comp_rgba[i * 4 + 3], raw_rgba[i * 4 + 3]
+                );
+            }
+        }
+
+        // When the layer has a non-disabled mask with default_color == 0,
+        // pixels outside the mask bbox should be fully transparent in the
+        // composite even if they have content in the raw.
+        if let Some(mask_meta) = layer.mask() {
+            if !mask_meta.disabled && mask_meta.default_color == 0 {
+                let ml = mask_meta.left;
+                let mt = mask_meta.top;
+                let mr = mask_meta.left + mask_meta.width() as i32;
+                let mb = mask_meta.top + mask_meta.height() as i32;
+
+                for y in 0..height as i32 {
+                    for x in 0..width as i32 {
+                        let outside_mask = x < ml || x >= mr || y < mt || y >= mb;
+                        if outside_mask {
+                            let idx = (y * width as i32 + x) as usize;
+                            assert_eq!(
+                                comp_rgba[idx * 4 + 3], 0,
+                                "{}: layer '{}' pixel ({},{}) outside mask bbox \
+                                 should have alpha 0 in composite, got {}",
+                                name, layer.name(), x, y, comp_rgba[idx * 4 + 3]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write the composited PNG (this is the one a psd-to-json port uses).
+        let filename = format!("{:02}_{}.png", idx, sanitize(layer.name()));
+        write_rgba_png(&out_dir.join("layers").join(&filename), width, height, &comp_rgba)
+            .with_context(|| format!("writing layer PNG {filename}"))?;
+        layer_png_count += 1;
+
+        // --- 3. Raster mask as standalone grayscale PNG ---
+        if let Some(mask_meta) = layer.mask() {
+            if let Some(mask_pixels) = layer.mask_pixels() {
+                let mw = mask_meta.width();
+                let mh = mask_meta.height();
+                if mw > 0 && mh > 0 && mask_pixels.len() == (mw * mh) as usize {
+                    let mask_name = format!("{:02}_{}_mask.png", idx, sanitize(layer.name()));
+                    write_gray_png(&out_dir.join("masks").join(&mask_name), mw, mh, &mask_pixels)
+                        .with_context(|| format!("writing mask PNG {mask_name}"))?;
+                    mask_png_count += 1;
+                }
+            }
+        }
+    }
+
+    // --- 2b. Psd::group_bounds() ---
+    // For every group that has at least one non-empty layer, verify that
+    // group_bounds() returns Some and that the bbox fully encloses every
+    // descendant layer.
+    for (&gid, _group) in psd.groups() {
+        if let Some((g_top, g_left, g_bottom, g_right)) = psd.group_bounds(gid) {
+            for idx in psd.groups()[&gid].contained_layers() {
+                let l = psd.layer_by_idx(idx);
+                if l.width() == 0 || l.height() == 0 {
+                    continue;
+                }
+                assert!(
+                    l.layer_top() >= g_top
+                        && l.layer_left() >= g_left
+                        && l.layer_bottom() <= g_bottom
+                        && l.layer_right() <= g_right,
+                    "{}: group '{}' bounds ({},{},{},{}) don't enclose layer '{}' ({},{},{},{})",
+                    name,
+                    psd.groups()[&gid].name(),
+                    g_top, g_left, g_bottom, g_right,
+                    l.name(),
+                    l.layer_top(), l.layer_left(), l.layer_bottom(), l.layer_right()
+                );
+            }
+        }
+    }
+
+    // --- 4. JSON document ---
+    let data_json = build_json(psd);
+    let json_path = out_dir.join("data.json");
+    fs::write(&json_path, serde_json::to_vec_pretty(&data_json)?)?;
+    // Round-trip the JSON to make sure we produced something well-formed.
+    let reparsed: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
+    assert_eq!(reparsed["width"], json!(width));
+    assert_eq!(reparsed["height"], json!(height));
+    assert!(reparsed["layers"].is_array(), "{}: layers is not array", name);
+
+    Ok(format!(
+        "{name}: {w}x{h}, {layers} layers ({layer_pngs} PNGs, {masks} masks), {groups} groups -> {dir}",
+        name = name,
+        w = width,
+        h = height,
+        layers = psd.layers().len(),
+        layer_pngs = layer_png_count,
+        masks = mask_png_count,
+        groups = psd.groups().len(),
+        dir = out_dir.display()
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// JSON tree construction
+// ---------------------------------------------------------------------------
+
+/// Build a nested JSON representation of the PSD's layer tree, mirroring the
+/// kind of document psd-to-json emits. The schema is intentionally close to
+/// what psd-to-json writes so a downstream Rust port has a clear target.
+fn build_json(psd: &psd::Psd) -> Value {
+    let mut root = json!({
+        "width": psd.width(),
+        "height": psd.height(),
+        "color_mode": format!("{:?}", psd.color_mode()),
+        "depth": format!("{:?}", psd.depth()),
+        "layers": Value::Array(vec![]),
+    });
+
+    // For each group, compute the minimum flat-layer index of any layer
+    // whose ancestor chain contains that group. That index is then used as
+    // the group's "position" among its siblings so groups and loose layers
+    // sort into the same order Photoshop shows them.
+    let mut group_min_idx: HashMap<u32, usize> = HashMap::new();
+    for (idx, layer) in psd.layers().iter().enumerate() {
+        let mut cur = layer.parent_id();
+        while let Some(gid) = cur {
+            group_min_idx
+                .entry(gid)
+                .and_modify(|v| *v = (*v).min(idx))
+                .or_insert(idx);
+            cur = psd.groups().get(&gid).and_then(|g| g.parent_id());
+        }
+    }
+    // A group with no descendants at all still needs a key; fall back to a
+    // very large value so it sorts to the end of its parent's children.
+    let group_key = |gid: u32| -> usize {
+        group_min_idx.get(&gid).copied().unwrap_or(usize::MAX)
+    };
+
+    // Index direct children for each group id (plus `None` = top-level).
+    let mut children_by_group: HashMap<Option<u32>, Vec<Child>> = HashMap::new();
+    for (idx, layer) in psd.layers().iter().enumerate() {
+        children_by_group
+            .entry(layer.parent_id())
+            .or_default()
+            .push(Child::Layer(idx));
+    }
+    for (&group_id, group) in psd.groups() {
+        children_by_group
+            .entry(group.parent_id())
+            .or_default()
+            .push(Child::Group(group_id));
+    }
+
+    // Sort each bucket so loose layers and groups interleave in document order.
+    for children in children_by_group.values_mut() {
+        children.sort_by_key(|c| match c {
+            Child::Layer(idx) => *idx,
+            Child::Group(gid) => group_key(*gid),
+        });
+    }
+
+    let tops = children_by_group
+        .remove(&None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| child_to_json(psd, c, &children_by_group, 0))
+        .collect();
+    root["layers"] = Value::Array(tops);
+    root
+}
+
+/// A direct child of either the PSD root or a group.
+#[derive(Clone, Copy)]
+enum Child {
+    Layer(usize),
+    Group(u32),
+}
+
+fn child_to_json(
+    psd: &psd::Psd,
+    child: Child,
+    children_by_group: &HashMap<Option<u32>, Vec<Child>>,
+    depth: usize,
+) -> Value {
+    match child {
+        Child::Layer(idx) => layer_to_json(psd.layer_by_idx(idx), idx, depth),
+        Child::Group(gid) => {
+            let group = &psd.groups()[&gid];
+            let kids: Vec<Value> = children_by_group
+                .get(&Some(gid))
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| child_to_json(psd, c, children_by_group, depth + 1))
+                .collect();
+            group_to_json(psd, group, gid, depth, kids)
+        }
+    }
+}
+
+fn layer_to_json(layer: &PsdLayer, idx: usize, depth: usize) -> Value {
+    let mut attrs: BTreeMap<&str, Value> = BTreeMap::new();
+    attrs.insert("kind", json!("layer"));
+    attrs.insert("index", json!(idx));
+    attrs.insert("depth", json!(depth));
+    attrs.insert("name", json!(layer.name()));
+    attrs.insert("visible", json!(layer.visible()));
+    attrs.insert("opacity", json!(layer.opacity()));
+    attrs.insert("alpha", json!(layer.opacity() as f64 / 255.0));
+    attrs.insert("blend_mode", json!(format!("{:?}", layer.blend_mode())));
+    attrs.insert("clipping_mask", json!(layer.is_clipping_mask()));
+    attrs.insert("x", json!(layer.layer_left()));
+    attrs.insert("y", json!(layer.layer_top()));
+    attrs.insert("width", json!(layer.width()));
+    attrs.insert("height", json!(layer.height()));
+    attrs.insert(
+        "bbox",
+        json!({
+            "left":   layer.layer_left(),
+            "top":    layer.layer_top(),
+            "right":  layer.layer_right(),
+            "bottom": layer.layer_bottom(),
+        }),
+    );
+
+    if let Some(mask) = layer.mask() {
+        attrs.insert(
+            "mask",
+            json!({
+                "left":   mask.left,
+                "top":    mask.top,
+                "right":  mask.right,
+                "bottom": mask.bottom,
+                "width":  mask.width(),
+                "height": mask.height(),
+                "default_color":     mask.default_color,
+                "disabled":          mask.disabled,
+                "invert":            mask.invert,
+                "relative_to_layer": mask.relative_to_layer,
+            }),
+        );
+    }
+
+    if layer.has_vector_mask() {
+        if let Some(vm) = layer.vector_mask() {
+            let paths: Vec<Value> = vm
+                .paths
+                .iter()
+                .map(|sp| {
+                    let knots: Vec<Value> = sp
+                        .knots
+                        .iter()
+                        .map(|k| {
+                            json!({
+                                "anchor":    [k.anchor.x, k.anchor.y],
+                                "preceding": [k.preceding.x, k.preceding.y],
+                                "following": [k.following.x, k.following.y],
+                                "linked":    k.linked,
+                            })
+                        })
+                        .collect();
+                    json!({ "closed": sp.closed, "knots": knots })
+                })
+                .collect();
+            attrs.insert(
+                "vector_mask",
+                json!({
+                    "disabled":   vm.disabled,
+                    "invert":     vm.invert,
+                    "not_linked": vm.not_linked,
+                    "paths":      paths,
+                }),
+            );
+        }
+    }
+
+    Value::Object(attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+fn group_to_json(psd: &psd::Psd, group: &PsdGroup, gid: u32, depth: usize, children: Vec<Value>) -> Value {
+    let mut attrs: BTreeMap<&str, Value> = BTreeMap::new();
+    attrs.insert("kind", json!("group"));
+    attrs.insert("id", json!(gid));
+    attrs.insert("depth", json!(depth));
+    attrs.insert("name", json!(group.name()));
+    attrs.insert("visible", json!(group.visible()));
+    attrs.insert("opacity", json!(group.opacity()));
+    attrs.insert("alpha", json!(group.opacity() as f64 / 255.0));
+    attrs.insert("blend_mode", json!(format!("{:?}", group.blend_mode())));
+
+    // Use computed bounds (union of descendant layers) instead of the
+    // unreliable values from the group divider record.
+    if let Some((top, left, bottom, right)) = psd.group_bounds(gid) {
+        attrs.insert("x", json!(left));
+        attrs.insert("y", json!(top));
+        attrs.insert("width", json!((right - left) + 1));
+        attrs.insert("height", json!((bottom - top) + 1));
+        attrs.insert(
+            "computed_bounds",
+            json!({ "top": top, "left": left, "bottom": bottom, "right": right }),
+        );
+    } else {
+        // Empty group — use zeros.
+        attrs.insert("x", json!(0));
+        attrs.insert("y", json!(0));
+        attrs.insert("width", json!(0));
+        attrs.insert("height", json!(0));
+    }
+
+    attrs.insert("children", Value::Array(children));
+    Value::Object(attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// PNG writers
+// ---------------------------------------------------------------------------
+
+fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+    assert_eq!(
+        rgba.len(),
+        (width * height * 4) as usize,
+        "RGBA buffer size mismatch for {}",
+        path.display()
+    );
+    let file = fs::File::create(path)?;
+    let w = &mut std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    Ok(())
+}
+
+fn write_gray_png(path: &Path, width: u32, height: u32, gray: &[u8]) -> Result<()> {
+    assert_eq!(
+        gray.len(),
+        (width * height) as usize,
+        "grayscale buffer size mismatch for {}",
+        path.display()
+    );
+    let file = fs::File::create(path)?;
+    let w = &mut std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(gray)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the per-test output directory. Prefer the Cargo-provided tmp dir
+/// for integration tests; fall back to `<manifest_dir>/target/psd-to-json-out`
+/// if that variable is missing (e.g. running under a non-standard harness).
+fn output_root() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_TMPDIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .context("CARGO_MANIFEST_DIR not set")?;
+    Ok(PathBuf::from(manifest).join("target").join("psd-to-json-out"))
+}
+
+/// Make a layer name safe to use as a file name on disk.
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}

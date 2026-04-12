@@ -25,6 +25,7 @@ use crate::sections::image_data_section::ImageDataSection;
 pub use crate::sections::image_resources_section::ImageResource;
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
+pub use crate::sections::layer_and_mask_information_section::layer::BlendMode;
 pub use crate::sections::layer_and_mask_information_section::layer::PsdGroup;
 pub use crate::sections::layer_and_mask_information_section::layer::PsdLayer;
 pub use crate::sections::layer_and_mask_information_section::layer_mask::LayerMask;
@@ -193,6 +194,55 @@ impl Psd {
                     [group.contained_layers.clone()],
             ),
             None => None,
+        }
+    }
+
+    /// Compute the bounding box of a group as the union of all its descendant
+    /// layers' bounds.
+    ///
+    /// PSD group divider records typically carry zeroed bounds, so the values
+    /// returned by `PsdGroup::layer_top()` / `layer_left()` / etc. are
+    /// unreliable. Use this method instead to get the area actually covered by
+    /// the group's content.
+    ///
+    /// Returns `(top, left, bottom, right)` in document coordinates (same
+    /// coordinate space as `PsdLayer::layer_top()` etc.). Returns `None` if
+    /// `group_id` is unknown or the group has no non-empty descendant layers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some((top, left, bottom, right)) = psd.group_bounds(group.id()) {
+    ///     let width  = (right - left) + 1;
+    ///     let height = (bottom - top) + 1;
+    ///     println!("group covers {}x{} at ({}, {})", width, height, left, top);
+    /// }
+    /// ```
+    pub fn group_bounds(&self, group_id: u32) -> Option<(i32, i32, i32, i32)> {
+        let group = self.groups().get(&group_id)?;
+        let mut top = i32::MAX;
+        let mut left = i32::MAX;
+        let mut bottom = i32::MIN;
+        let mut right = i32::MIN;
+        let mut found = false;
+
+        for idx in group.contained_layers() {
+            let layer = self.layer_by_idx(idx);
+            // Skip zero-sized layers (group markers, empty layers).
+            if layer.width() == 0 || layer.height() == 0 {
+                continue;
+            }
+            top = top.min(layer.layer_top());
+            left = left.min(layer.layer_left());
+            bottom = bottom.max(layer.layer_bottom());
+            right = right.max(layer.layer_right());
+            found = true;
+        }
+
+        if found {
+            Some((top, left, bottom, right))
+        } else {
+            None
         }
     }
 
