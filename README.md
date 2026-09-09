@@ -1,47 +1,31 @@
 psd
 ===
 
-[![Build status](https://circleci.com/gh/chinedufn/psd.svg?style=shield&circle-token=:circle-token)](https://circleci.com/gh/chinedufn/psd) [![docs](https://docs.rs/psd/badge.svg)](https://docs.rs/psd)
+> A Rust API for reading and writing Adobe Photoshop (PSD) files.
 
-> A Rust API for parsing and working with PSD files.
+This is a fork of [chinedufn/psd][upstream], maintained in support of a Rust port of
+[psd-to-json](https://github.com/laffan/psd-to-json). It keeps the upstream parsing API intact and
+adds mask access, per-layer compositing and the ability to **create** PSD files. See
+[UPDATES.md](UPDATES.md) for a change-by-change account of what this fork adds, and
+[CHANGELOG.md](CHANGELOG.md) for the upstream-style changelog.
 
-## Live Demo
+The fork branched from upstream at [`28357a2`][fork-point], one commit past the `0.3.5` release.
 
-The `psd` crate can be compiled to WebAssembly and used in a browser.
+[upstream]: https://github.com/chinedufn/psd
+[fork-point]: https://github.com/chinedufn/psd/commit/28357a2
 
-[In the live demo you can visualize a PSD in the browser](https://chinedufn.github.io/psd/drag-drop-demo/),
-toggle layers on and off and drag and drop a new PSD into the demo.
+## Installing
 
-![Demo screenshot](./examples/drag-drop-browser/demo-screenshot.png)
+This fork isn't published to crates.io, so depend on it by git:
 
-Check out the [examples/drag-drop-browser](examples/drag-drop-browser) directory for instructions on running the demo locally.
+```toml
+[dependencies]
+psd = { git = "https://github.com/laffan/psd" }
+```
 
-## The Psd Book
-
-The _WIP_ [The Psd Book](https://chinedufn.github.io/psd) will contain information about getting started with the `psd` crate,
-a description of the architecture and information on how to get started.
-
-## API Docs
-
-Check out the [API documentation](https://chinedufn.github.io/psd/api/psd) to see everything that you can currently access.
-
-## Background / Initial Motivation
-
-I'm working on a game and part of my asset compilation process was a script that did the following:
-
-1. Iterate over all PSD files
-
-2. Export every PSD into a PNG, ignoring any layers that begin with an `_`
-
-3. Combine PNGs into a texture atlas
-
-For a couple of years I was using `imagemagick` to power step 2, but after getting a new laptop and upgrading `imagemagick` versions it stopped working.
-
-After a bit of Googling I couldn't land on a solution for my problem so I decided to make this crate.
-
-My approach was to support as much of the PSD spec as I needed, so there might be bits of information that you'd like to make use of that aren't currently supported.
-
-That said, if there's anything missing that you need [please feel very free to open an issue](https://github.com/chinedufn/psd/issues)!
+The upstream crate is on [crates.io](https://crates.io/crates/psd) and
+[docs.rs](https://docs.rs/psd), but those don't include anything on this page marked as a fork
+addition. To read this fork's API docs, run `cargo doc --open`.
 
 ## Usage
 
@@ -67,6 +51,8 @@ fn main () {
     // Get the combined final image for the PSD.
     let final_image: Vec<u8> = psd.rgba();
 
+    // Layers come back in the order that Photoshop's layers panel shows them,
+    // top first.
     for layer in psd.layers().iter() {
         let name = layer.name();
 
@@ -104,7 +90,7 @@ fn main () {
 
 ### Creating a PSD
 
-You can also build a PSD from scratch, with layers and nested groups.
+`PsdBuilder` writes a PSD from scratch, with layers and nested groups.
 
 ```rust
 use psd::{BlendMode, GroupBuilder, LayerBuilder, PsdBuilder};
@@ -144,19 +130,150 @@ fn main () {
 }
 ```
 
-See [examples/create_psd.rs](examples/create_psd.rs) for a runnable version:
+For a runnable version:
 
 ```sh
 cargo run --example create_psd -- /tmp/created.psd
 ```
 
-We write 8 bit RGB PSDs. Layer masks, vector masks and adjustment layers aren't
-written yet - please open an issue if you need them.
+## What's supported
+
+### Reading
+
+| | |
+|---|---|
+| Document | Width, height, bit depth, colour mode, channel count |
+| Layers | Name (including the unicode `luni` name), position, opacity, visibility, blend mode, clipping flag |
+| Groups | Arbitrary nesting, parent/child relationships, computed bounds |
+| Masks | Raster mask bounding box, flags and pixels; vector mask Bézier paths |
+| Channels | Raw and RLE (PackBits) compressed |
+| Image resources | Slices (v6, v7 and v8) |
+| Rendering | Per-layer RGBA, per-layer composite with opacity and mask applied, whole-document flattening with blend modes |
+
+### Writing
+
+| | |
+|---|---|
+| Document | 8 bit RGB at any size the format allows |
+| Layers | Name, position, opacity, visibility, blend mode, clipping flag, pixels |
+| Groups | Arbitrary nesting, name, opacity, visibility, blend mode, collapsed state |
+| Channels | RLE (PackBits) by default, raw on request |
+| Flattened image | Composited from the layer stack, or supplied by the caller |
+
+### Not supported
+
+The Photoshop specification is large and this crate covers the parts that its users have needed.
+[Please open an issue][issues] if something you need is missing.
+
+- **PSB** (large document format). Adding it should be straightforward.
+- **ZIP compressed channels**, with and without prediction.
+- **Colour modes other than RGB** — CMYK, Indexed, Grayscale, Lab and Duotone may parse but are
+  untested and can produce wrong pixels. Only 8 bit depth is well tested; 16 bit is partially
+  handled and 32 bit is not.
+- **12 of the 28 blend modes** when flattening a document — pass through, dissolve, darker colour,
+  lighter colour, vivid light, linear light, pin light, hard mix, hue, saturation, colour and
+  luminosity will panic in `flatten_layers_rgba`. Every blend mode is *read and written* correctly,
+  so `layer.blend_mode()` is always right; only the built-in renderer is incomplete.
+- **Vector mask clipping** when compositing. The path data is exposed so a caller can rasterize it.
+- **Writing masks, adjustment layers, text layers and image resources.** A parse, modify, write
+  round trip therefore loses masks.
+
+[issues]: https://github.com/laffan/psd/issues
+
+## Documentation
+
+- **API docs** — `cargo doc --open`
+- **The Psd Book** — `cd book && mdbook build`, or read the sources in [book/src](book/src). The
+  [hosted copy](https://chinedufn.github.io/psd) is built from upstream and doesn't include this
+  fork's chapters.
+- **[UPDATES.md](UPDATES.md)** — everything this fork changed, and why
+
+## Examples
+
+### Creating a PSD
+
+[examples/create_psd.rs](examples/create_psd.rs) builds a document with a background, a group, a
+nested group and a hidden layer, then writes it to disk.
+
+```sh
+cargo run --example create_psd -- /tmp/created.psd
+```
+
+### Drag and drop browser demo
+
+The crate compiles to WebAssembly. The demo visualizes a PSD in the browser, lets you toggle layers
+on and off, and accepts a new PSD by drag and drop.
+
+[![Demo screenshot](./examples/drag-drop-browser/demo-screenshot.png)](https://chinedufn.github.io/psd/drag-drop-demo/)
+
+[The live demo](https://chinedufn.github.io/psd/drag-drop-demo/) is built from upstream. See
+[examples/drag-drop-browser](examples/drag-drop-browser) for instructions on running it against this
+fork locally.
+
+## Tests
+
+```sh
+cargo test --all
+```
+
+Tests parse the PSD files in [tests/fixtures](tests/fixtures), each of which is described in
+[tests/fixtures/README.md](tests/fixtures/README.md). [tests/write_psd.rs](tests/write_psd.rs)
+round trips everything the writer produces back through the parser.
+
+[tests/psd_to_json_integration.rs](tests/psd_to_json_integration.rs) exercises the features that a
+Rust port of psd-to-json depends on and can be pointed at your own files:
+
+```sh
+PSD_TO_JSON_INPUT=/path/to/psds cargo test --test psd_to_json_integration -- --nocapture
+```
+
+## Background
+
+From the original author, on why the crate exists:
+
+> I'm working on a game and part of my asset compilation process was a script that did the
+> following:
+>
+> 1. Iterate over all PSD files
+> 2. Export every PSD into a PNG, ignoring any layers that begin with an `_`
+> 3. Combine PNGs into a texture atlas
+>
+> For a couple of years I was using `imagemagick` to power step 2, but after getting a new laptop
+> and upgrading `imagemagick` versions it stopped working.
+>
+> After a bit of Googling I couldn't land on a solution for my problem so I decided to make this
+> crate.
+>
+> My approach was to support as much of the PSD spec as I needed, so there might be bits of
+> information that you'd like to make use of that aren't currently supported.
+
+The fork exists for a similar reason: [psd-to-json](https://github.com/laffan/psd-to-json) leans on
+Python's [psd-tools](https://github.com/psd-tools/psd-tools), and porting it to Rust needed mask
+data, per-layer compositing and PSD creation that the crate didn't have yet.
+
+## Acknowledgements
+
+`psd` was created by [Chinedu Francis Nwafili](https://github.com/chinedufn) and its
+[contributors](https://github.com/chinedufn/psd/graphs/contributors). Everything here builds on
+their work — the parser, the section-by-section architecture, the test fixtures and the book are
+all theirs. Please send bug reports that aren't specific to this fork
+[upstream](https://github.com/chinedufn/psd/issues).
+
+[psd-tools](https://github.com/psd-tools/psd-tools) was used as an independent implementation to
+check that the files this crate writes are valid.
 
 ## See Also
 
-- [PSD specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/) - the basis of our API
+- [PSD specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/) — the basis of
+  our API
+- [psd-tools](https://github.com/psd-tools/psd-tools) — a mature Python implementation
+- [ag-psd](https://github.com/Agamnentzar/ag-psd) — a JavaScript reader and writer
 
 ## License
 
-MIT
+Dual licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
