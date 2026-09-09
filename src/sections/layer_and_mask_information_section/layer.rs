@@ -157,8 +157,14 @@ impl PsdGroup {
         psd_height: u32,
         group_id: Option<u32>,
     ) -> Self {
-        let layer_properties =
+        let mut layer_properties =
             LayerProperties::from_layer_record(name, layer_record, psd_width, psd_height, group_id);
+
+        // Photoshop leaves a group record's blend mode key set to 'norm' and
+        // puts the group's real blend mode in its section divider setting.
+        if let Some(blend_mode) = layer_record.section_divider_blend_mode {
+            layer_properties.blend_mode = blend_mode;
+        }
 
         PsdGroup {
             id,
@@ -444,7 +450,7 @@ impl GroupDivider {
 }
 
 /// Describes how to blend a layer with the layer below it
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum BlendMode {
     PassThrough = 0,
@@ -511,6 +517,44 @@ impl BlendMode {
             _ => None,
         }
     }
+
+    /// The four byte blend mode key that a PSD file stores this mode as.
+    ///
+    /// The inverse of [`BlendMode::match_mode`].
+    pub(crate) fn key(self) -> [u8; 4] {
+        let key: &[u8; 4] = match self {
+            BlendMode::PassThrough => b"pass",
+            BlendMode::Normal => b"norm",
+            BlendMode::Dissolve => b"diss",
+            BlendMode::Darken => b"dark",
+            BlendMode::Multiply => b"mul ",
+            BlendMode::ColorBurn => b"idiv",
+            BlendMode::LinearBurn => b"lbrn",
+            BlendMode::DarkerColor => b"dkCl",
+            BlendMode::Lighten => b"lite",
+            BlendMode::Screen => b"scrn",
+            BlendMode::ColorDodge => b"div ",
+            BlendMode::LinearDodge => b"lddg",
+            BlendMode::LighterColor => b"lgCl",
+            BlendMode::Overlay => b"over",
+            BlendMode::SoftLight => b"sLit",
+            BlendMode::HardLight => b"hLit",
+            BlendMode::VividLight => b"vLit",
+            BlendMode::LinearLight => b"lLit",
+            BlendMode::PinLight => b"pLit",
+            BlendMode::HardMix => b"hMix",
+            BlendMode::Difference => b"diff",
+            BlendMode::Exclusion => b"smud",
+            BlendMode::Subtract => b"fsub",
+            BlendMode::Divide => b"fdiv",
+            BlendMode::Hue => b"hue ",
+            BlendMode::Saturation => b"sat ",
+            BlendMode::Color => b"colr",
+            BlendMode::Luminosity => b"lum ",
+        };
+
+        *key
+    }
 }
 
 /// A layer record within the layer info section
@@ -547,6 +591,12 @@ pub struct LayerRecord {
     pub(super) blend_mode: BlendMode,
     /// Group divider tag
     pub(super) divider_type: Option<GroupDivider>,
+    /// The blend mode that a group's section divider setting carries.
+    ///
+    /// Photoshop writes a group's real blend mode here and leaves the record's
+    /// own blend mode key set to 'norm', so this is what a group should be
+    /// blended with when it is present.
+    pub(super) section_divider_blend_mode: Option<BlendMode>,
     /// Layer mask metadata (bbox, flags)
     pub(super) layer_mask: Option<LayerMask>,
     /// Vector mask data (Bezier paths)

@@ -267,7 +267,7 @@ fn sixteen_to_eight_rgba(channel1: &[u8], channel2: &[u8]) -> Vec<u8> {
 }
 
 /// Indicates how a channe'sl data is compressed
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum PsdChannelCompression {
     /// Not compressed

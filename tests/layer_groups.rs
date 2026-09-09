@@ -1,5 +1,26 @@
-use psd::{Psd, PsdGroup};
+use psd::{BlendMode, Psd, PsdGroup};
 const TOP_LEVEL_ID: u32 = 1;
+
+/// A group's settings come from the layer record that opens the folder, not
+/// from the hidden bounding section record that closes it.
+///
+/// Photoshop also leaves the opening record's blend mode key set to 'norm' and
+/// puts the group's real blend mode in its section divider setting, which is
+/// where a new group's pass through blending lives.
+///
+/// cargo test --test layer_groups group_settings_come_from_the_opening_record -- --exact
+#[test]
+fn group_settings_come_from_the_opening_record() {
+    let psd = include_bytes!("fixtures/groups/green-1x1-one-group-one-layer-inside.psd");
+    let psd = Psd::from_bytes(psd).unwrap();
+
+    let group = psd.groups().get(&TOP_LEVEL_ID).unwrap();
+
+    assert_eq!(group.name(), "group");
+    assert_eq!(group.blend_mode(), BlendMode::PassThrough);
+    assert_eq!(group.opacity(), 255);
+    assert_eq!(group.visible(), true);
+}
 
 /// Verify that we can get a group by it's ID.
 #[test]

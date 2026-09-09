@@ -4,11 +4,84 @@ Changes made to this fork of [chinedufn/psd](https://github.com/chinedufn/psd)
 in support of building a Rust port of
 [psd-to-json](https://github.com/laffan/psd-to-json).
 
-All changes live on the `claude/prepare-psd-rust-conversion-aOGdA` branch.
+Changes live on the `claude/prepare-psd-rust-conversion-aOGdA` and
+`claude/psd-creation-layers-7f8had` branches.
 
 ---
 
 ## New API
+
+### Creating PSD files
+
+```rust
+use psd::{BlendMode, GroupBuilder, LayerBuilder, PsdBuilder};
+
+let mut psd = PsdBuilder::new(64, 64);
+
+psd.add_layer(LayerBuilder::new("Background").rgba(64, 64, background_pixels));
+
+psd.add_group(
+    GroupBuilder::new("Shapes")
+        .add_layer(
+            LayerBuilder::new("Red Square")
+                .rgba(24, 24, red_pixels)
+                .at(8, 8)
+                .opacity(160)
+                .blend_mode(BlendMode::Multiply),
+        )
+        .add_group(GroupBuilder::new("Highlights").add_layer(highlight_layer)),
+);
+
+let bytes: Vec<u8> = psd.to_bytes()?;
+```
+
+The crate can now write PSD files as well as read them. This is what a Rust
+port of psd-to-json needs in order to round trip a document, and what any tool
+that generates PSDs from other sources needs.
+
+**Types**
+
+- `PsdBuilder` - canvas size, a layer stack, and `to_bytes()`
+- `GroupBuilder` - a group, which can hold layers and other groups at any depth
+- `LayerBuilder` - a pixel layer
+- `PsdWriteError` - the validation failures that `to_bytes()` can return
+
+**What is written**
+
+- 8 bit RGB, with an alpha channel on every layer
+- Nested groups, written as Photoshop writes them: a hidden bounding section
+  record closing each folder and an `lsct` record opening it
+- Layer name (`luni` unicode block plus the record's Pascal string), position,
+  opacity, visibility, blend mode and clipping flag
+- Group name, opacity, visibility, blend mode and collapsed state
+- RLE (PackBits) compressed channels by default, raw channels on request
+- A flattened image in the image data section, composited from the layer stack
+  or supplied by the caller
+
+**What is not written**
+
+Layer and vector masks, adjustment/text/shape layers, image resources, colour
+modes other than RGB, and depths other than 8 bits.
+
+**Verification**
+
+`tests/write_psd.rs` round trips every feature back through `Psd::from_bytes`.
+The output was also checked against [psd-tools][psd-tools], an independent
+implementation, which reads the nesting, names, offsets, blend modes, opacity,
+visibility and pixel data back correctly.
+
+One detail that came out of that check: Photoshop stores a transparent
+document's flattened image already composited over **white**, so a fully
+transparent pixel is stored as `[255, 255, 255, 0]`. The crate's own fixtures
+agree - `blending/blue-red-1x1-normal.psd` stores `[127, 63, 191, 192]` for a
+pixel whose true colour is `[85, 0, 170, 192]`. We write the same way, so
+readers that undo the matte recover the original colour.
+
+[psd-tools]: https://github.com/psd-tools/psd-tools
+
+**Source:** `src/write/`
+
+---
 
 ### `PsdLayer::composite_rgba()`
 
@@ -257,6 +330,48 @@ dependencies.
 
 ---
 
+## Parsing fixes
+
+### Group properties come from the record that opens the folder
+
+A PSD describes a group with two layer records - a hidden bounding section
+record that closes the folder and a record that opens it. The opening record is
+the one that carries the group's name, opacity, visibility, blend mode and
+mask; the closing record always holds placeholder values (opacity 255, normal
+blend, visible).
+
+We were building `PsdGroup` from the closing record, so `group.opacity()` was
+always 255, `group.visible()` was always `true` and `group.blend_mode()` was
+always `Normal`, no matter what the file said. Group masks were missed for the
+same reason. Groups are now built from the record that opens the folder.
+
+Photoshop also leaves that record's own blend mode key set to `norm` and writes
+the group's real blend mode into its `lsct` section divider setting, which is
+where a new group's pass through blending lives. `PsdGroup::blend_mode()` now
+prefers that value, so a plain Photoshop group reports `PassThrough` instead of
+`Normal`.
+
+**Source:** `src/sections/layer_and_mask_information_section/mod.rs`
+
+### Long layer names no longer overflow
+
+A layer record's Pascal string name is padded to a multiple of four bytes, and
+we computed that padding as `(name_len + 1) % 4` in `u8` arithmetic. A name
+that filled the length byte panicked on the add. The length is widened first
+now.
+
+**Source:** `src/sections/layer_and_mask_information_section/mod.rs`
+
+### Layer ordering is documented correctly
+
+`Psd::layers()` and `Psd::layer_by_idx()` claimed that index 0 was the bottom
+layer. It is actually the top layer - the reader reverses the file's records,
+which are stored bottom-up. Only the doc comments changed.
+
+**Source:** `src/lib.rs`
+
+---
+
 ## Known limitations
 
 These are things psd-to-json uses from psd-tools that this fork does not yet
@@ -280,3 +395,7 @@ cover:
    visibility during animation frame export. The Rust crate does not expose a
    setter for `visible`. A port can work around this by ignoring the visibility
    flag during animation rendering.
+
+5. **Writing masks** -- the new `PsdBuilder` does not write layer masks or
+   vector masks, so a parse-modify-write round trip loses them. Reading them is
+   unaffected.

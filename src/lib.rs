@@ -34,6 +34,7 @@ pub use crate::sections::layer_and_mask_information_section::vector_mask::{
 };
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
+pub use crate::write::{GroupBuilder, LayerBuilder, PsdBuilder, PsdWriteError};
 
 use self::sections::file_header_section::FileHeaderSection;
 
@@ -41,6 +42,7 @@ mod blend;
 mod psd_channel;
 mod render;
 mod sections;
+mod write;
 
 /// An list of errors returned when processing PSD file.
 ///
@@ -151,7 +153,8 @@ impl Psd {
 
 // Methods for working with layers
 impl Psd {
-    /// Get all of the layers in the PSD
+    /// Get all of the layers in the PSD, ordered from the top of Photoshop's
+    /// layers panel downwards.
     pub fn layers(&self) -> &Vec<PsdLayer> {
         &self.layer_and_mask_information_section.layers
     }
@@ -165,7 +168,8 @@ impl Psd {
 
     /// Get a layer by index.
     ///
-    /// index 0 is the bottom layer, index 1 is the layer above that, etc
+    /// Layers are ordered from the top of Photoshop's layers panel downwards,
+    /// so index 0 is the top layer, index 1 is the layer below that, etc.
     pub fn layer_by_idx(&self, idx: usize) -> &PsdLayer {
         self.layer_and_mask_information_section
             .layers

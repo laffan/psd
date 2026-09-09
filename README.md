@@ -45,6 +45,8 @@ That said, if there's anything missing that you need [please feel very free to o
 
 ## Usage
 
+### Reading a PSD
+
 ```rust
 use psd::{BlendMode, ColorMode, Psd, PsdChannelCompression, PsdChannelKind};
 
@@ -99,6 +101,57 @@ fn main () {
     }
 }
 ```
+
+### Creating a PSD
+
+You can also build a PSD from scratch, with layers and nested groups.
+
+```rust
+use psd::{BlendMode, GroupBuilder, LayerBuilder, PsdBuilder};
+
+fn main () {
+    let mut psd = PsdBuilder::new(64, 64);
+
+    // Layers are added from the bottom of the layer stack upwards.
+    psd.add_layer(
+        LayerBuilder::new("Background")
+            // [R, G, B, A, R, G, B, A, ...], width * height * 4 bytes long.
+            .rgba(64, 64, vec![255, 255, 255, 255].repeat(64 * 64))
+    );
+
+    // Groups hold layers and other groups, so they're how you nest.
+    let shapes = GroupBuilder::new("Shapes")
+        .add_layer(
+            LayerBuilder::new("Red Square")
+                .rgba(24, 24, vec![220, 60, 60, 255].repeat(24 * 24))
+                .at(8, 8)
+        )
+        .add_group(
+            GroupBuilder::new("Highlights").add_layer(
+                LayerBuilder::new("Blue Square")
+                    .rgba(24, 24, vec![60, 90, 220, 255].repeat(24 * 24))
+                    .at(28, 28)
+                    .opacity(160)
+                    .blend_mode(BlendMode::Multiply)
+            )
+        );
+
+    psd.add_group(shapes);
+
+    let bytes: Vec<u8> = psd.to_bytes().unwrap();
+
+    std::fs::write("./my-psd-file.psd", bytes).unwrap();
+}
+```
+
+See [examples/create_psd.rs](examples/create_psd.rs) for a runnable version:
+
+```sh
+cargo run --example create_psd -- /tmp/created.psd
+```
+
+We write 8 bit RGB PSDs. Layer masks, vector masks and adjustment layers aren't
+written yet - please open an issue if you need them.
 
 ## See Also
 

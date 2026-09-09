@@ -76,6 +76,16 @@ struct Frame {
     name: String,
     group_id: u32,
     parent_group_id: u32,
+    /// The layer record that opened this group.
+    ///
+    /// A group is described by two records - the one that opens the folder,
+    /// which carries the group's name, opacity, visibility, blend mode and
+    /// mask, and a hidden bounding section record that closes it. We hold on to
+    /// the opening record so that we can build the `PsdGroup` from it once we
+    /// reach the closing record.
+    ///
+    /// `None` for the root frame, which no record opened.
+    record: Option<LayerRecord>,
 }
 
 impl LayerAndMaskInformationSection {
@@ -146,6 +156,7 @@ impl LayerAndMaskInformationSection {
             name: String::from("root"),
             group_id: 0,
             parent_group_id: 0,
+            record: None,
         }];
 
         // Viewed group counter
@@ -163,9 +174,10 @@ impl LayerAndMaskInformationSection {
 
                     let frame = Frame {
                         start_idx: layers.len(),
-                        name: layer_record.name,
+                        name: layer_record.name.clone(),
                         group_id: already_viewed,
                         parent_group_id: current_group_id,
+                        record: Some(layer_record),
                     };
 
                     stack.push(frame);
@@ -180,11 +192,17 @@ impl LayerAndMaskInformationSection {
                         end: layers.len(),
                     };
 
+                    // The group's properties come from the record that
+                    // opened the folder. The bounding section record that we're
+                    // looking at now is hidden in Photoshop and always carries
+                    // placeholder settings.
+                    let group_record = frame.record.as_ref().unwrap_or(&layer_record);
+
                     groups.push(PsdGroup::new(
                         frame.name,
                         frame.group_id,
                         range,
-                        &layer_record,
+                        group_record,
                         psd_size.0,
                         psd_size.1,
                         if frame.parent_group_id > 0 {
@@ -438,11 +456,15 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     // after it. Here we skip over those throwaday bytes.
     //
     // The 1 is the 1 byte that we read for the name length
-    let bytes_mod_4 = (name_len + 1) % 4;
+    //
+    // We widen the length before adding to it since a name that fills the
+    // length byte would otherwise overflow.
+    let bytes_mod_4 = (name_len as u32 + 1) % 4;
     let padding = (4 - bytes_mod_4) % 4;
-    cursor.read(padding as u32);
+    cursor.read(padding);
 
     let mut divider_type = None;
+    let mut section_divider_blend_mode = None;
     let mut vector_mask: Option<VectorMask> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
@@ -464,7 +486,10 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 // data present only if length >= 12
                 if additional_layer_info_len >= 12 {
                     let _signature = cursor.read_4();
-                    let _key = cursor.read_4();
+
+                    let mut key = [0; 4];
+                    key.copy_from_slice(cursor.read_4());
+                    section_divider_blend_mode = BlendMode::match_mode(key);
                 }
 
                 // data present only if length >= 16
@@ -496,6 +521,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         clipping_base,
         blend_mode,
         divider_type,
+        section_divider_blend_mode,
         layer_mask,
         vector_mask,
     })
