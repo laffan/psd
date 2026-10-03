@@ -47,6 +47,12 @@ mod bytes;
 mod composite;
 mod rle;
 
+/// PackBits, for tests elsewhere in the crate that need real RLE data.
+#[cfg(test)]
+pub(crate) fn pack_bits_for_tests(scanline: &[u8]) -> Vec<u8> {
+    pack_bits(scanline)
+}
+
 /// The signature that prefixes a blend mode key and every additional layer
 /// information block.
 const EIGHT_BIM: &[u8; 4] = b"8BIM";
@@ -274,7 +280,7 @@ impl LayerBuilder {
             _ => 3,
         };
 
-        self.rgba.iter().skip(offset).step_by(4).copied().collect()
+        plane(&self.rgba, offset, 4)
     }
 }
 
@@ -587,11 +593,18 @@ impl PsdBuilder {
         let mut channel_data = ByteWriter::new();
         let mut record_count = 0;
 
+        // Every layer's channels are compressed up front, side by side, and
+        // handed out in stack order as the records are written.
+        let mut layers = vec![];
+        collect_layers(&self.children, &mut layers);
+        let mut encoded = encode_layers(&layers, self.compression).into_iter();
+
         self.write_children(
             &self.children,
             &mut records,
             &mut channel_data,
             &mut record_count,
+            &mut encoded,
         );
 
         let mut layer_info = ByteWriter::with_capacity(records.len() + channel_data.len() + 2);
@@ -625,11 +638,13 @@ impl PsdBuilder {
         records: &mut ByteWriter,
         channel_data: &mut ByteWriter,
         record_count: &mut usize,
+        encoded: &mut dyn Iterator<Item = Vec<EncodedChannel>>,
     ) {
         for child in children {
             match child {
                 Child::Layer(layer) => {
-                    self.write_layer_record(layer, records, channel_data);
+                    let channels = encoded.next().unwrap_or_default();
+                    self.write_layer_record(layer, channels, records, channel_data);
                     *record_count += 1;
                 }
                 Child::Group(group) => {
@@ -639,7 +654,13 @@ impl PsdBuilder {
                     self.write_divider_record(records, channel_data);
                     *record_count += 1;
 
-                    self.write_children(&group.children, records, channel_data, record_count);
+                    self.write_children(
+                        &group.children,
+                        records,
+                        channel_data,
+                        record_count,
+                        encoded,
+                    );
 
                     self.write_folder_record(group, records, channel_data);
                     *record_count += 1;
@@ -652,6 +673,7 @@ impl PsdBuilder {
     fn write_layer_record(
         &self,
         layer: &LayerBuilder,
+        channels: Vec<EncodedChannel>,
         records: &mut ByteWriter,
         channel_data: &mut ByteWriter,
     ) {
@@ -666,20 +688,6 @@ impl PsdBuilder {
                 layer.left + layer.width as i32,
             )
         };
-
-        let channels: Vec<(PsdChannelKind, PsdChannelCompression, Vec<u8>)> = LAYER_CHANNEL_ORDER
-            .iter()
-            .map(|channel| {
-                let (compression, data) = encode_channel(
-                    &layer.channel_plane(*channel),
-                    layer.width as usize,
-                    layer.height as usize,
-                    self.compression,
-                );
-
-                (*channel, compression, data)
-            })
-            .collect();
 
         write_record(
             records,
@@ -753,7 +761,7 @@ impl PsdBuilder {
         let height = self.height as usize;
 
         let planes: Vec<Vec<u8>> = (0..channel_count as usize)
-            .map(|offset| rgba.iter().skip(offset).step_by(4).copied().collect())
+            .map(|offset| plane(rgba, offset, 4))
             .collect();
 
         match self.compression {
@@ -762,14 +770,11 @@ impl PsdBuilder {
 
                 // Every scanline's compressed length comes first, for all of
                 // the channels, and then all of the compressed scanlines.
-                let packed: Vec<Vec<Vec<u8>>> = planes
-                    .iter()
-                    .map(|plane| {
-                        (0..height)
-                            .map(|row| pack_bits(&plane[row * width..(row + 1) * width]))
-                            .collect()
-                    })
-                    .collect();
+                let packed: Vec<Vec<Vec<u8>>> = in_parallel(&planes, |plane| {
+                    (0..height)
+                        .map(|row| pack_bits(&plane[row * width..(row + 1) * width]))
+                        .collect()
+                });
 
                 for plane in &packed {
                     for scanline in plane {
@@ -792,6 +797,96 @@ impl PsdBuilder {
             }
         }
     }
+}
+
+/// One layer channel, ready to write: which channel, how it was compressed,
+/// and the bytes that follow the compression marker.
+type EncodedChannel = (PsdChannelKind, PsdChannelCompression, Vec<u8>);
+
+/// Every pixel layer in a stack, in the order `write_children` reaches them.
+fn collect_layers<'a>(children: &'a [Child], out: &mut Vec<&'a LayerBuilder>) {
+    for child in children {
+        match child {
+            Child::Layer(layer) => out.push(layer),
+            Child::Group(group) => collect_layers(&group.children, out),
+        }
+    }
+}
+
+/// Split and compress every channel of every layer.
+///
+/// Each channel is its own job — a plane pulled out of the layer's RGBA and
+/// PackBits-encoded a scanline at a time, depending on nothing else — so they
+/// are spread over the machine's cores. The bytes are exactly those one
+/// thread would write: only the order the work is *done* in changes.
+fn encode_layers(
+    layers: &[&LayerBuilder],
+    compression: PsdChannelCompression,
+) -> Vec<Vec<EncodedChannel>> {
+    let jobs: Vec<(usize, PsdChannelKind)> = (0..layers.len())
+        .flat_map(|layer| LAYER_CHANNEL_ORDER.iter().map(move |kind| (layer, *kind)))
+        .collect();
+    let mut done = in_parallel(&jobs, |(layer, kind)| {
+        let layer = layers[*layer];
+        let (used, data) = encode_channel(
+            &layer.channel_plane(*kind),
+            layer.width as usize,
+            layer.height as usize,
+            compression,
+        );
+        (*kind, used, data)
+    })
+    .into_iter();
+
+    layers
+        .iter()
+        .map(|_| done.by_ref().take(LAYER_CHANNEL_ORDER.len()).collect())
+        .collect()
+}
+
+/// `work` over every item, on as many threads as the machine offers, with
+/// the answers in the items' order.
+fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(items.len());
+    if threads <= 1 {
+        return items.iter().map(work).collect();
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut answers: Vec<Option<R>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = vec![];
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(at) else { break };
+                        mine.push((at, work(item)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        let mut answers: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+        for worker in workers {
+            for (at, answer) in worker.join().expect("a PSD writer thread panicked") {
+                answers[at] = Some(answer);
+            }
+        }
+        answers
+    });
+    answers.iter_mut().map(|a| a.take().expect("every item is answered")).collect()
+}
+
+/// One channel of interleaved pixels, pulled out into its own plane.
+fn plane(interleaved: &[u8], offset: usize, stride: usize) -> Vec<u8> {
+    interleaved
+        .chunks_exact(stride)
+        .map(|pixel| pixel[offset])
+        .collect()
 }
 
 /// Walk a layer stack, checking every layer and counting the records that it

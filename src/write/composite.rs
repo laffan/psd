@@ -52,34 +52,45 @@ fn draw_layer(layer: &LayerBuilder, canvas: &mut [u8], width: i32, height: i32, 
         return;
     }
 
+    // The columns of the layer that land on the canvas, worked out once
+    // rather than tested for every pixel.
+    let first_column = (-layer.left).max(0);
+    let last_column = (width - layer.left).min(layer.width as i32);
+    if first_column >= last_column {
+        return;
+    }
+    let run = (last_column - first_column) as usize * 4;
+
     for row in 0..layer.height as i32 {
         let canvas_row = layer.top + row;
         if canvas_row < 0 || canvas_row >= height {
             continue;
         }
 
-        for column in 0..layer.width as i32 {
-            let canvas_column = layer.left + column;
-            if canvas_column < 0 || canvas_column >= width {
-                continue;
-            }
+        let source_start = (row as usize * layer.width as usize + first_column as usize) * 4;
+        let destination_start =
+            (canvas_row as usize * width as usize + (layer.left + first_column) as usize) * 4;
+        let source = &layer.rgba[source_start..source_start + run];
+        let destination = &mut canvas[destination_start..destination_start + run];
 
-            let source = (row as usize * layer.width as usize + column as usize) * 4;
-            let source_alpha = multiply(layer.rgba[source + 3], opacity);
+        for (source, destination) in source.chunks_exact(4).zip(destination.chunks_exact_mut(4)) {
+            let source_alpha = multiply(source[3], opacity);
             if source_alpha == 0 {
                 continue;
             }
 
-            let destination = (canvas_row as usize * width as usize + canvas_column as usize) * 4;
+            // Two cases `source_over` answers with the source pixel itself:
+            // nothing underneath, or nothing showing through. Most of a
+            // sketch is the first and most of a painting the second.
+            if destination[3] == 0 || source_alpha == 255 {
+                destination[..3].copy_from_slice(&source[..3]);
+                destination[3] = source_alpha;
+                continue;
+            }
 
             source_over(
-                &[
-                    layer.rgba[source],
-                    layer.rgba[source + 1],
-                    layer.rgba[source + 2],
-                    source_alpha,
-                ],
-                &mut canvas[destination..destination + 4],
+                &[source[0], source[1], source[2], source_alpha],
+                destination,
             );
         }
     }
@@ -190,6 +201,30 @@ mod tests {
             matte_over_white(&[85, 0, 170, 192]),
             vec![127, 63, 191, 192]
         );
+    }
+
+    /// The two cases `draw_layer` answers without `source_over` are ones
+    /// `source_over` would answer the same way, for every input.
+    #[test]
+    fn the_shortcuts_are_what_source_over_says() {
+        for alpha in 1..=255u8 {
+            for colour in [0u8, 1, 77, 128, 254, 255] {
+                let source = [colour, 255 - colour, colour / 3, alpha];
+                for below in [[0u8, 0, 0, 0], [9, 200, 31, 0]] {
+                    let mut destination = below;
+                    source_over(&source, &mut destination);
+                    assert_eq!(destination, source);
+                }
+            }
+        }
+        for below in [[9u8, 200, 31, 1], [0, 0, 0, 128], [255, 255, 255, 255]] {
+            for colour in [0u8, 77, 255] {
+                let source = [colour, colour, 255 - colour, 255];
+                let mut destination = below;
+                source_over(&source, &mut destination);
+                assert_eq!(destination, source);
+            }
+        }
     }
 
     #[test]

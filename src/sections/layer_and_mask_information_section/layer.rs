@@ -678,4 +678,26 @@ impl IntoRgba for PsdLayer {
     fn psd_height(&self) -> u32 {
         self.layer_properties.psd_height
     }
+
+    fn rect_inside_psd(&self) -> Option<(usize, usize, usize, usize)> {
+        let p = &self.layer_properties;
+        // From the edges rather than `width()`, which an empty layer's
+        // record (right one less than left) would overflow.
+        let width = p.layer_right as i64 - p.layer_left as i64 + 1;
+        let height = p.layer_bottom as i64 - p.layer_top as i64 + 1;
+        let inside = p.layer_left >= 0
+            && p.layer_top >= 0
+            && width > 0
+            && height > 0
+            && p.layer_left as i64 + width <= p.psd_width as i64
+            && p.layer_top as i64 + height <= p.psd_height as i64;
+        inside.then(|| {
+            (
+                p.layer_left as usize,
+                p.layer_top as usize,
+                width as usize,
+                height as usize,
+            )
+        })
+    }
 }

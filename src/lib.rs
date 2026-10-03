@@ -377,6 +377,10 @@ impl IntoRgba for Psd {
     fn psd_height(&self) -> u32 {
         self.height()
     }
+
+    fn rect_inside_psd(&self) -> Option<(usize, usize, usize, usize)> {
+        Some((0, 0, self.width() as usize, self.height() as usize))
+    }
 }
 
 #[cfg(test)]
